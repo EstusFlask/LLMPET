@@ -37,6 +37,7 @@ const { log } = require('./log');
 const { detectEmotion } = require('./emotion');
 const { promptTitle } = require('./transcript');
 const { createCodexSessionIndex, DEFAULT_PATH: DEFAULT_SESSION_INDEX_PATH } = require('./codex-session-index');
+const { classifyError, normalizeQuota } = require('./codex-status');
 
 const SESSIONS_DIR = path.join(os.homedir(), '.codex', 'sessions');
 const POLL_MS = 2500;
@@ -239,13 +240,18 @@ function toRateLimits(rl) {
   if (Number.isFinite(s.used_percent)) {
     out.secondaryUsedPercent = s.used_percent;
     out.secondaryWindowMinutes = Number(s.window_minutes) || null;
+    out.secondaryResetsAt = Number(s.resets_at) ? Number(s.resets_at) * 1000 : null;
   }
+  out.limitId = String(rl.limit_id || 'codex');
+  out.reachedType = rl.rate_limit_reached_type || null;
   if (typeof rl.plan_type === 'string') out.planType = rl.plan_type;
   return out.usedPercent != null || out.secondaryUsedPercent != null ? out : null;
 }
 
 function createCodexWatch(deps) {
   const core = deps.core;
+  const onStatus = typeof deps.onStatus === 'function' ? deps.onStatus : () => {};
+  const onQuota = typeof deps.onQuota === 'function' ? deps.onQuota : () => {};
   const onRateLimits = typeof deps.onRateLimits === 'function' ? deps.onRateLimits : () => {};
   const sessionsDir = deps.sessionsDir || SESSIONS_DIR; // 测试可注入
   const pollMs = deps.pollMs || POLL_MS;
@@ -266,6 +272,21 @@ function createCodexWatch(deps) {
   let tickCount = 0;       // 全量扫描节拍（FULL_SWEEP_TICKS 轮一次）
   let missingLogged = false;
   let rateLimits = null;
+
+  function report(t, kind, obj = {}, extra = {}) {
+    const p = obj.payload || {};
+    if (p.turn_id) t.turnId = String(p.turn_id);
+    onStatus({ sessionId: t.sid, turnId: t.turnId || '', kind, at: Date.parse(obj.timestamp) || Date.now(),
+      cwd: t.cwd || '', title: t.sessionTitle || '', provider: t.provider || '', model: t.model || '',
+      transcriptPath: t.fp, limitId: t.limitId || 'codex', source: 'rollout', ...extra });
+  }
+  function reportQuota(t, raw, at, seed = false) {
+    const quota = normalizeQuota(raw, at);
+    if (!quota) return;
+    t.limitId = quota.limitId;
+    onQuota({ ...quota, provider: t.provider || '',
+      providerVerified: t.provider === 'openai' || !!t.provider && quota.quotaProvider === t.provider }, { seed });
+  }
 
   // 热扫描：最近 HOT_DAYS 天的日期目录（新会话都创建在「今天」的目录里）
   function dayDirs() {
@@ -450,6 +471,7 @@ function createCodexWatch(deps) {
     if (type === 'turn_context') {
       if (typeof p.cwd === 'string' && p.cwd) t.cwd = p.cwd;
       if (typeof p.model === 'string' && p.model) t.model = p.model;
+      if (typeof p.model_provider === 'string' && p.model_provider) t.provider = p.model_provider;
       return;
     }
 
@@ -473,6 +495,7 @@ function createCodexWatch(deps) {
               questions,
             },
           });
+          report(t, 'waiting_input', obj);
           return;
         }
         markWork(t);
@@ -500,6 +523,7 @@ function createCodexWatch(deps) {
 
     if (type !== 'event_msg') return;
     const et = p.type;
+    if (p.turn_id) t.turnId = String(p.turn_id);
 
     // Codex Desktop's current rollout schema mirrors user text and collaboration
     // lifecycle as typed item_completed rows. Older builds use the legacy rows
@@ -508,6 +532,7 @@ function createCodexWatch(deps) {
       const item = p.item;
       if (item.type === 'UserMessage') {
         handleUserMessage(t, itemText(item), Date.parse(obj.timestamp));
+        report(t, 'running', obj);
       } else if (item.type === 'AgentMessage' && item.phase === 'final_answer') {
         const text = itemText(item);
         if (text) t.lastAgentMessage = text;
@@ -520,11 +545,14 @@ function createCodexWatch(deps) {
     switch (et) {
       case 'user_message': {
         handleUserMessage(t, typeof p.message === 'string' ? p.message : '', Date.parse(obj.timestamp));
+        report(t, 'running', obj);
         break;
       }
       case 'task_started':
         beginTurn(t);
+        t.turnId = String(p.turn_id || `${obj.timestamp || Date.now()}-${t.offset}`);
         update(t, 'thinking', 'TaskStarted');
+        report(t, 'running', obj);
         break;
       case 'agent_message':
         // 兜底记住最后一条正文（task_complete 通常自带 last_agent_message）
@@ -549,6 +577,7 @@ function createCodexWatch(deps) {
         t.subagentActive = false;
         t.activeSubagents.clear();
         t.pendingSubagentCallIds.clear();
+        report(t, 'completed', obj);
         break;
       }
       case 'turn_aborted':
@@ -558,6 +587,10 @@ function createCodexWatch(deps) {
         t.subagentActive = false;
         t.activeSubagents.clear();
         t.pendingSubagentCallIds.clear();
+        {
+          const failure = classifyError(p);
+          report(t, failure.kind === 'quota_exhausted' || failure.kind === 'transient_error' ? failure.kind : 'interrupted', obj, failure.kind === 'failed' ? { message: failure.message } : failure);
+        }
         break;
       case 'context_compacted':
         update(t, 'sweeping', 'PreCompact');
@@ -590,11 +623,20 @@ function createCodexWatch(deps) {
         if (cu) core.setContextUsage(t.sid, cu);
         const rl = toRateLimits(p.rate_limits);
         if (rl) { rateLimits = rl; onRateLimits(rl); }
+        reportQuota(t, p.rate_limits, Date.parse(obj.timestamp) || Date.now());
         break;
       }
       case 'error':
       case 'stream_error':
         update(t, 'error', 'ApiError', { errorType: 'api_error' });
+        // Errors without a terminal flag may be part of Codex's own reconnect
+        // loop. Record them, but never start another writer from that alone.
+        report(t, p.will_retry === false || p.willRetry === false ? classifyError(p).kind : 'error_observed', obj, { message: classifyError(p).message });
+        break;
+      case 'task_failed':
+      case 'turn_failed':
+        update(t, 'error', 'ApiError', { errorType: classifyError(p).kind });
+        report(t, classifyError(p).kind, obj, { message: classifyError(p).message });
         break;
       default:
         // 授权/追问类事件（TUI 的 on-request 审批等；名字随版本演进，按后缀匹配）
@@ -608,6 +650,7 @@ function createCodexWatch(deps) {
               questions,
             },
           } : undefined);
+          report(t, 'waiting_input', obj);
         }
         break;
     }
@@ -618,6 +661,7 @@ function createCodexWatch(deps) {
     t.sid = fileSessionId(t.fp, meta.id || meta.session_id);
     if (typeof meta.cwd === 'string' && meta.cwd) t.cwd = meta.cwd;
     if (typeof meta.originator === 'string') t.originator = meta.originator;
+    if (typeof meta.model_provider === 'string') t.provider = meta.model_provider;
     // guardian / auto-review 等内部子线程：整个文件不是用户会话
     const src = meta.source;
     if (meta.thread_source === 'subagent' || (src && typeof src === 'object' && src.subagent)) {
@@ -668,6 +712,11 @@ function createCodexWatch(deps) {
         const obj = parseLine(line);
         if (!obj) continue;
         const p = obj.payload || {};
+        if (p.turn_id) t.turnId = String(p.turn_id);
+        if (obj.type === 'turn_context') {
+          if (p.model) t.model = p.model;
+          if (p.model_provider) t.provider = p.model_provider;
+        }
         if (obj.type === 'response_item') {
           if ((p.type === 'function_call' || p.type === 'custom_tool_call') && p.name === 'request_user_input') {
             const questions = parseRequestUserInput(p.arguments);
@@ -766,6 +815,7 @@ function createCodexWatch(deps) {
           if (cu) contextUsage = cu;
           const rl = toRateLimits(p.rate_limits);
           if (rl && (!rateLimits || rl.ts >= rateLimits.ts)) { rateLimits = rl; onRateLimits(rl); }
+          reportQuota(t, p.rate_limits, Date.parse(obj.timestamp) || mtimeMs, true);
         }
       }
     }
@@ -792,6 +842,7 @@ function createCodexWatch(deps) {
     });
     t.titleSet = !!title;
     t.sessionTitle = title;
+    report(t, turnActive ? (inferredState === 'notification' ? 'waiting_input' : 'running') : 'idle', {}, { seed: true, at: mtimeMs });
   }
 
   // “掠夺”要拿的是用户最近的 Codex 会话，而不是仅限 30 分钟内仍活跃的

@@ -45,6 +45,8 @@ const { createTerritory, DEFAULT_RIVALS } = require('./backend/territory');
 const { launchClaude, launchCodex, launchDsh, ensureDshWeb, launchExecutable, findCli } = require('./backend/launch');
 const { createAgentStartup } = require('./backend/agent-startup');
 const { createCodexWatch } = require('./backend/codex-watch');
+const { createCodexAutomation } = require('./backend/codex-automation');
+const { createCodexExecutor, readAccountQuotas } = require('./backend/codex-control');
 const { createDshWatch } = require('./backend/dsh-watch');
 const { createCodexMetering } = require('./backend/codex-metering');
 const { createTravelManager } = require('./backend/travel');
@@ -87,6 +89,8 @@ let server = null;
 let stopWatcher = null;
 let territory = null;
 let codexWatch = null;  // Codex rollout 只读监听器
+let codexAutomation = null;
+let codexExecutor = null;
 let codexMetering = null; // Codex rollout 累计 token 台账（与状态 watcher 解耦）
 let dshWatch = null;    // DeepSeek Harness 会话日志只读监听器
 let travelManager = null; // 独立只读旅行任务 + 明信片/成长台账
@@ -1085,6 +1089,20 @@ function bootBackend() {
   runtimeMonitor.start();
 
   // Codex 后端：只读监听 ~/.codex/sessions 的 rollout（无钩子、零侵入）。
+  codexExecutor = createCodexExecutor();
+  codexAutomation = createCodexAutomation({
+    statePath: process.env.LLMPET_AUTOMATION_STATE || undefined,
+    onChange: () => { if (archiveWin && !archiveWin.isDestroyed()) sendArchive('automation:changed', codexAutomation && codexAutomation.snapshot()); },
+    run: (job, onThread) => process.env.OCTOPUS_NO_NET === '1'
+      ? Promise.resolve({ ok: false, kind: 'failed', message: '离线模式禁止自动任务联网 / Offline mode blocks automated inference' })
+      : codexExecutor.run(job, onThread),
+    readQuotas: () => process.env.OCTOPUS_NO_NET === '1'
+      ? Promise.resolve({ ok: false, message: '离线模式不查询账号额度 / Offline mode disables account quota checks' })
+      : readAccountQuotas(),
+    flushStatus: () => { if (codexWatch) codexWatch.tick(); },
+    isBusy: () => [...core.sessions.values()].some(s =>
+      ['working', 'thinking', 'juggling', 'sweeping', 'carrying', 'notification'].includes(s.state)),
+  });
   // LLMPET_NO_CODEX=1 关闭（比如只想盯 Claude 的机器）。
   if (process.env.LLMPET_NO_CODEX === '1') {
     log('main', 'LLMPET_NO_CODEX=1 — Codex watcher disabled');
@@ -1096,11 +1114,14 @@ function bootBackend() {
     codexMetering.start(30000);
     codexWatch = createCodexWatch({
       core,
+      onStatus: (event) => codexAutomation.observe(event),
+      onQuota: (quota, options) => codexAutomation.observeQuota(quota, options),
       // 开发/E2E 可用 LLMPET_CODEX_DIR 指到假目录，不碰真实 ~/.codex
       sessionsDir: process.env.LLMPET_CODEX_DIR || undefined,
     });
     codexWatch.start();
   }
+  if (process.env.LLMPET_NO_CODEX !== '1') codexAutomation.start();
 
   // DeepSeek Harness 后端：只读监听 $DSH_HOME|~/.dsh/sessions 的会话日志
   // （同样无钩子、零侵入；不装 dsh 的机器上 watcher 只是空转）。
@@ -1247,6 +1268,18 @@ function registerIpc() {
   };
 
   ipcMain.handle('get-config', (e) => frontendConfig(senderAgent(e)));
+  const automationCall = (event, fn) => {
+    if (!archiveWin || archiveWin.isDestroyed() || event.sender !== archiveWin.webContents) return { ok: false, message: 'Open the workbench to configure automation' };
+    if (!codexAutomation) return { ok: false, message: 'Automation unavailable' };
+    try { const value = fn(); return { ok: true, value }; }
+    catch (err) { return { ok: false, message: String(err.message || err) }; }
+  };
+  ipcMain.handle('automation-get', e => automationCall(e, () => codexAutomation.snapshot()));
+  ipcMain.handle('automation-save', (e, rule) => automationCall(e, () => codexAutomation.saveRule(rule)));
+  ipcMain.handle('automation-remove', (e, id) => automationCall(e, () => codexAutomation.removeRule(id)));
+  ipcMain.handle('automation-reset', (e, id) => automationCall(e, () => codexAutomation.resetCount(id)));
+  ipcMain.handle('automation-cancel', (e, id) => automationCall(e, () => codexAutomation.cancelJob(id)));
+  ipcMain.handle('automation-refresh-quota', e => automationCall(e, () => { codexAutomation.refreshQuotas(); return true; }));
   ipcMain.handle('get-stats', (e) => {
     // Do not return a stale cached price/token snapshot to a newly opened
     // dashboard. buildStats is read-only and reflects the latest ledger scan.
@@ -2003,6 +2036,8 @@ if (!gotTheLock) {
 app.on('window-all-closed', () => { /* tray app: stay alive */ });
 
 app.on('before-quit', () => {
+  try { if (codexAutomation) codexAutomation.stop(); } catch {}
+  try { if (codexExecutor) codexExecutor.stop(); } catch {}
   try { if (territory) territory.stop(); } catch {}
   try { if (travelManager) travelManager.shutdown(); } catch {}
   try { if (sessionArchive) sessionArchive.stop(); } catch {}
