@@ -12,7 +12,7 @@ function classifyError(value) {
   const status = details && (details.httpStatusCode || details.http_status_code) || error.httpStatusCode;
   if (status >= 400 && status < 500 && status !== 429) return { kind: 'failed', code, message };
   if (/unauthorized|authentication|invalid.?api.?key|forbidden|bad.?request|context.?window|sandbox|permission.?denied/i.test(text)) return { kind: 'failed', code, message };
-  if (/connection|stream.?disconnect|stream.?connection|timeout|timed.?out|network|internal.?server|server.?overload|too.?many.?failed.?attempt|rate.?limit|ECONN|ENOTFOUND|\b(?:429|502|503|504)\b/i.test(text)) return { kind: 'transient_error', code, message };
+  if (/connection|stream.?disconnect|stream.?connection|timeout|timed.?out|network|internal.?server|server.?error|overloaded.?error|server.?overload|too.?many.?failed.?attempt|rate.?limit|ECONN|ENOTFOUND|\b(?:429|502|503|504)\b/i.test(text)) return { kind: 'transient_error', code, message };
   return { kind: 'failed', code, message };
 }
 

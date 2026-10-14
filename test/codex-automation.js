@@ -40,6 +40,8 @@ function fakeChild() { const child = new EventEmitter(); child.stdin = new PassT
   assert.throws(() => normalizeRule({ trigger: 'idle', action: 'shutdown' }));
   assert.strictEqual(normalizeRule({ sessionId: SID, trigger: 'quota_exhausted', action: 'shutdown' }).delaySeconds, 60);
   assert.throws(() => normalizeRule({ sessionId: SID, trigger: 'completed', action: 'new_task' }));
+  const powerRule = normalizeRule({ sessionId: SID, trigger: 'ended', action: 'shutdown', prompt: 'stale draft', cwd: root, limitId: 'stale-bucket' });
+  assert.strictEqual(powerRule.prompt, ''); assert.strictEqual(powerRule.cwd, ''); assert.strictEqual(powerRule.limitId, '');
   const raw = normalizeQuota({ limit_id: 'other', primary: { used_percent: 99, resets_at: Math.floor(time / 1000) + 600 }, secondary: { used_percent: 100, resets_at: Math.floor(time / 1000) + 2000 } }, time);
   assert.strictEqual(raw.limitId, 'other'); assert(raw.secondary.resetsAt > time);
   assert(!quotaAvailable(raw, time - 1, time), 'both quota windows must recover');
@@ -48,6 +50,22 @@ function fakeChild() { const child = new EventEmitter(); child.stdin = new PassT
   assert(!quotaAvailable(quota({ provider: 'custom' }), time - 1, time), 'custom rollouts can contain unrelated cached account quotas');
   assert(quotaAvailable(quota({ provider: 'custom', providerVerified: true }), time - 1, time), 'a provider adapter can explicitly establish quota provenance');
   assert(!quotaAvailable(quota({ primary: { usedPercent: 0, resetsAt: time - 1 } }), time - 1, time), 'expired window needs a fresh query');
+
+  {
+    const f = fixture(); f.rule({ trigger: 'interrupted', action: 'shutdown' }); f.event({ kind: 'completed' });
+    assert.strictEqual(f.engine.snapshot().jobs.length, 0, 'normal completion is not interruption');
+    f.event({ kind: 'interrupted' }); assert.strictEqual(f.engine.snapshot().jobs.length, 1);
+  }
+  for (const kind of ['completed', 'interrupted', 'failed', 'transient_error', 'quota_exhausted']) {
+    const f = fixture(); f.rule({ trigger: 'ended', action: 'shutdown' });
+    const turnId = `combined-${kind}`; f.event({ kind, turnId }); f.event({ kind, turnId });
+    assert.strictEqual(f.engine.snapshot().jobs.length, 1, `combined end trigger handles ${kind} exactly once`);
+    assert.strictEqual(f.engine.snapshot().jobs[0].trigger, kind, 'keep the specific reason in the execution record');
+  }
+  for (const kind of ['running', 'idle', 'waiting_input', 'error_observed', 'quota_restored']) {
+    const f = fixture(); f.rule({ trigger: 'ended', action: 'shutdown' }); f.event({ kind });
+    assert.strictEqual(f.engine.snapshot().jobs.length, 0, `${kind} is not a terminal event`);
+  }
 
   {
     const f = fixture(); f.rule({ enabled: false }); f.event(); await f.engine.tick(); assert.strictEqual(f.runs.length, 0);

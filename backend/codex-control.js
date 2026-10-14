@@ -6,8 +6,8 @@ const path = require('path');
 const { findCli } = require('./launch');
 const { classifyError, normalizeQuota } = require('./codex-status');
 
-function spawnCodex(args, options = {}, deps = {}) {
-  const cli = (deps.findCli || findCli)('codex');
+function spawnAgent(name, args, options = {}, deps = {}) {
+  const cli = (deps.findCli || findCli)(name);
   const spawnImpl = deps.spawn || spawn;
   if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(cli)) {
     const quote = s => `'${String(s).replace(/'/g, "''")}'`;
@@ -16,6 +16,7 @@ function spawnCodex(args, options = {}, deps = {}) {
   }
   return spawnImpl(cli, args, options);
 }
+const spawnCodex = (args, options, deps) => spawnAgent('codex', args, options, deps);
 
 // Only read account/config metadata. Never start or resume a model turn here.
 function readAccountQuotas(deps = {}) {
@@ -112,4 +113,4 @@ function createCodexExecutor(deps = {}) {
   return { run, stop: () => { for (const child of children) { try { child.kill(); } catch {} } children.clear(); } };
 }
 
-module.exports = { spawnCodex, readAccountQuotas, createCodexExecutor };
+module.exports = { spawnAgent, spawnCodex, readAccountQuotas, createCodexExecutor };

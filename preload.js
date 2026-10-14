@@ -25,6 +25,7 @@ contextBridge.exposeInMainWorld('pet', {
   // 渲染进程 -> 主进程
   getConfig: () => ipcRenderer.invoke('get-config'),
   getAutomation: () => ipcRenderer.invoke('automation-get'),
+  rescanAutomationSessions: () => ipcRenderer.invoke('automation-rescan'),
   saveAutomationRule: (rule) => ipcRenderer.invoke('automation-save', rule),
   removeAutomationRule: (id) => ipcRenderer.invoke('automation-remove', id),
   resetAutomationCount: (id) => ipcRenderer.invoke('automation-reset', id),

@@ -7,25 +7,32 @@ const crypto = require('crypto');
 const { execFile } = require('child_process');
 const { quotaAvailable } = require('./codex-status');
 
-const TRIGGERS = ['completed', 'quota_exhausted', 'quota_restored', 'transient_error', 'failed', 'interrupted'];
+const TRIGGERS = ['completed', 'ended', 'quota_exhausted', 'quota_restored', 'transient_error', 'failed', 'interrupted'];
 const ACTIONS = ['continue', 'wait_quota', 'new_task', 'shutdown'];
 const TERMINAL = new Set(['completed', 'quota_exhausted', 'transient_error', 'failed', 'interrupted']);
 const PENDING = new Set(['scheduled', 'waiting_quota', 'waiting_idle']);
 const text = (v, max = 256) => typeof v === 'string' ? v.trim().slice(0, max) : '';
 const uuid = () => crypto.randomUUID();
 const DEFAULT_PROMPT = '继续原任务。先核对已完成的工作和当前状态，只继续尚未完成的部分；不要重复已经完成的外部操作。';
+const AGENTS = ['codex', 'claude', 'dsh'];
+const sessionKey = (agent, id) => `${agent || 'codex'}:${id}`;
 
 function normalizeRule(input) {
   if (!input || !TRIGGERS.includes(input.trigger) || !ACTIONS.includes(input.action)) throw new Error('Invalid trigger or action');
   const sessionId = text(input.sessionId);
-  if (!/^[0-9a-f]{8}-[0-9a-f-]{27,40}$/i.test(sessionId)) throw new Error('请选择或填写有效的 Codex 会话 ID / Select a valid Codex session');
+  const agent = input.agent || 'codex';
+  if (!AGENTS.includes(agent)) throw new Error('Invalid agent');
+  const validId = agent === 'dsh' ? /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/.test(sessionId) : /^[0-9a-f]{8}-[0-9a-f-]{27,40}$/i.test(sessionId);
+  if (!validId) throw new Error('请选择或填写有效的会话 ID / Select a valid session');
   const number = (v, fallback, min, max) => Math.min(max, Math.max(min, Number.isFinite(Number(v)) ? Math.round(Number(v)) : fallback));
-  const prompt = text(input.prompt, 12000) || DEFAULT_PROMPT;
+  const prompt = input.action === 'shutdown' ? '' : text(input.prompt, 12000) || DEFAULT_PROMPT;
   if (input.action === 'new_task' && !text(input.prompt)) throw new Error('新任务需要填写任务内容 / New task requires a prompt');
   if (input.action === 'wait_quota' && !['quota_exhausted', 'quota_restored'].includes(input.trigger)) throw new Error('等待额度动作需要额度触发条件 / Choose a quota trigger');
   return { id: text(input.id, 80) || uuid(), name: text(input.name, 100) || `${input.trigger} → ${input.action}`,
-    enabled: input.enabled === true, sessionId, trigger: input.trigger, action: input.action,
-    prompt, cwd: text(input.cwd, 2048), limitId: text(input.limitId, 100),
+    enabled: input.enabled === true, agent, sessionId, trigger: input.trigger, action: input.action,
+    prompt, cwd: input.action === 'new_task' ? text(input.cwd, 2048) : '',
+    limitId: input.trigger === 'quota_restored' || input.trigger === 'quota_exhausted' && input.action !== 'shutdown'
+      ? text(input.limitId, 100) : '',
     delaySeconds: number(input.delaySeconds, 15, input.action === 'shutdown' ? 60 : 0, 86400),
     maxRuns: number(input.maxRuns, input.action === 'continue' || input.action === 'wait_quota' ? 3 : 1, 1, 100),
     onlyWhenIdle: input.onlyWhenIdle !== false };
@@ -52,6 +59,7 @@ function createCodexAutomation(deps = {}) {
         || !saved.jobs.every(j => j && typeof j === 'object' && ACTIONS.includes(j.action))) throw new Error('Invalid automation state');
     state = { ...state, ...saved, rules: saved.rules.map(normalizeRule) };
     for (const job of state.jobs) {
+      job.agent = job.agent || 'codex';
       // Never replay a power action or a possibly-submitted task after restart.
       if (PENDING.has(job.status) && job.status !== 'waiting_quota' || job.status === 'running') {
         job.status = 'cancelled'; job.message = '应用已重启，取消未确认的动作 / Restarted; action cancelled';
@@ -82,6 +90,8 @@ function createCodexAutomation(deps = {}) {
   function saveRule(input) {
     if (loadError) throw new Error(loadError);
     const rule = normalizeRule(input);
+    if (rule.agent !== 'codex' && (rule.trigger === 'quota_restored' || rule.action === 'wait_quota'
+        || rule.trigger === 'quota_exhausted' && rule.action !== 'shutdown')) throw new Error('该 Agent 尚无可验证的额度恢复接口；额度耗尽时可选择关机 / Quota recovery is unavailable for this agent');
     if (!state.rules.some(r => r.id === rule.id) && state.rules.length >= 100) throw new Error('最多 100 条规则 / Maximum 100 rules');
     // An edit invalidates pending actions created from the old rule.
     for (const job of state.jobs) if (job.ruleId === rule.id && PENDING.has(job.status)) job.status = 'cancelled';
@@ -105,7 +115,9 @@ function createCodexAutomation(deps = {}) {
   function quotaKey(provider, id) { return `${provider || 'unknown'}:${id || 'codex'}`; }
   function schedule(event) {
     for (const rule of state.rules) {
-      if (!rule.enabled || rule.sessionId !== event.sessionId || rule.trigger !== event.kind) continue;
+      const matches = rule.trigger === 'ended' ? TERMINAL.has(event.kind) : rule.trigger === event.kind;
+      if (!rule.enabled || rule.agent !== (event.agent || 'codex') || rule.sessionId !== event.sessionId || !matches) continue;
+      if (deps.isAgentEnabled && !deps.isAgentEnabled(rule.agent)) continue;
       if (event.kind === 'quota_restored' && (rule.limitId || event.sourceLimitId || event.limitId || 'codex') !== event.limitId) continue;
       const count = Number(state.counts[rule.id]) || 0;
       if (count >= rule.maxRuns) continue;
@@ -115,13 +127,14 @@ function createCodexAutomation(deps = {}) {
       // recovery first as well. Shutdown remains independently selectable.
       const wait = rule.action === 'wait_quota' && event.kind !== 'quota_restored'
         || event.kind === 'quota_exhausted' && ['continue', 'new_task'].includes(rule.action);
-      const job = { id: uuid(), ruleId: rule.id, ruleName: rule.name, sessionId: event.sessionId,
+      const job = { id: uuid(), agent: rule.agent, ruleId: rule.id, ruleName: rule.name, sessionId: event.sessionId,
         trigger: event.kind, action: rule.action, prompt: rule.prompt,
         cwd: rule.cwd || event.cwd || '', provider: event.provider || '', model: event.model || '', limitId,
         status: wait ? 'waiting_quota' : 'scheduled', createdAt: now(), blockedAt: event.blockedAt || event.at || now(),
         requiresQuota: rule.action !== 'shutdown' && (wait || event.kind === 'quota_restored'),
         dueAt: now() + rule.delaySeconds * 1000 * (rule.action === 'continue' ? Math.min(16, 2 ** count) : 1),
         delaySeconds: rule.delaySeconds, onlyWhenIdle: rule.onlyWhenIdle };
+      if (wait && rule.agent !== 'codex') job.message = '额度耗尽，缺少可验证的恢复接口，保持挂起 / Quota exhausted; automatic recovery unavailable';
       state.jobs.unshift(job); state.counts[rule.id] = count + 1;
       log(job.status, '', { jobId: job.id, ruleId: rule.id, sessionId: job.sessionId });
     }
@@ -129,31 +142,36 @@ function createCodexAutomation(deps = {}) {
   }
   function observe(event) {
     if (!event || !event.sessionId) return;
-    const prev = sessions.get(event.sessionId) || {};
+    event = { ...event, agent: event.agent || 'codex' };
+    const identity = sessionKey(event.agent, event.sessionId);
+    const prev = sessions.get(identity) || {};
     if (prev.at && event.at && event.at < prev.at) return;
     const next = { ...prev, ...event };
-    sessions.set(event.sessionId, next);
-    if (sessions.size > 500) { const oldest = [...sessions.values()].sort((a, b) => a.at - b.at)[0]; if (oldest) sessions.delete(oldest.sessionId); }
+    sessions.set(identity, next);
+    if (sessions.size > 500) { const oldest = [...sessions.values()].sort((a, b) => a.at - b.at)[0]; if (oldest) sessions.delete(sessionKey(oldest.agent, oldest.sessionId)); }
     if (event.seed || !TERMINAL.has(event.kind)) {
       // User activity supersedes a queued retry, even while waiting for quota.
       let changed = false;
       if (!event.seed && ['running', 'waiting_input'].includes(event.kind)) {
-        for (const job of state.jobs) if (job.sessionId === event.sessionId && PENDING.has(job.status) && !running.has(event.sessionId)) {
+        for (const job of state.jobs) if (sessionKey(job.agent, job.sessionId) === identity && PENDING.has(job.status) && !running.has(identity)) {
           job.status = 'cancelled'; log('superseded', '', { jobId: job.id }); changed = true;
         }
       }
       if (changed) commit(); else onChange(); return;
     }
-    const managed = running.get(event.sessionId);
+    const managed = running.get(identity);
     if (managed) { managed.observedEvent = next; return; }
-    const key = `${event.sessionId}:${event.turnId || event.at}`;
-    if (state.seen.includes(key) || loadError || stopped) return;
+    const legacyKey = `${event.sessionId}:${event.turnId || event.at}`;
+    const key = `${event.agent}:${legacyKey}`;
+    if (state.seen.includes(key) || event.agent === 'codex' && state.seen.includes(legacyKey) || loadError || stopped) return;
     state.seen.push(key); state.seen = state.seen.slice(-2000);
     if (event.kind === 'quota_exhausted') next.blockedAt = event.at || now();
     schedule(next); commit();
   }
   function observeQuota(quota, options = {}) {
     if (!quota || !quota.provider || loadError) return;
+    quota = { ...quota, agent: quota.agent || 'codex' };
+    if (quota.agent !== 'codex') return; // No account quota API is assumed for other providers.
     const key = quotaKey(quota.provider, quota.limitId);
     const prior = state.quotas[key];
     if (prior && prior.at >= quota.at) return;
@@ -161,9 +179,9 @@ function createCodexAutomation(deps = {}) {
     if (!options.seed) {
       for (const session of sessions.values()) {
         const sourceLimitId = session.limitId || 'codex';
-        const matches = sourceLimitId === quota.limitId || state.rules.some(r => r.sessionId === session.sessionId
+        const matches = sourceLimitId === quota.limitId || state.rules.some(r => r.agent === session.agent && r.sessionId === session.sessionId
           && r.trigger === 'quota_restored' && r.limitId === quota.limitId);
-        if (session.kind === 'quota_exhausted' && session.provider === quota.provider
+        if (session.agent === quota.agent && session.kind === 'quota_exhausted' && session.provider === quota.provider
             && matches && quotaAvailable(quota, session.blockedAt || session.at, now())) {
           session.quotaRecoveredAt = quota.at;
           const event = { ...session, kind: 'quota_restored', at: quota.at, sourceLimitId, limitId: quota.limitId };
@@ -194,12 +212,12 @@ function createCodexAutomation(deps = {}) {
       log(job.status, job.message, { jobId: job.id }); commit(); return;
     }
     if (!deps.run) { job.status = 'failed'; job.message = 'Executor unavailable'; commit(); return; }
-    job.status = 'running'; job.startedAt = now(); running.set(job.sessionId, job); commit();
+    job.status = 'running'; job.startedAt = now(); running.set(sessionKey(job.agent, job.sessionId), job); commit();
     let result;
     try {
       result = await deps.run(job, id => {
-        if (job.action === 'new_task' && id !== job.sessionId) running.delete(job.sessionId);
-        running.set(id, job); job.targetSessionId = id;
+        if (job.action === 'new_task' && id !== job.sessionId) running.delete(sessionKey(job.agent, job.sessionId));
+        running.set(sessionKey(job.agent, id), job); job.targetSessionId = id;
       });
     } catch (err) { result = { ok: false, kind: 'failed', message: String(err.message).slice(0, 500) }; }
     if (deps.flushStatus) deps.flushStatus();
@@ -209,7 +227,7 @@ function createCodexAutomation(deps = {}) {
     commit();
     if (stopped) return;
     const observed = job.observedEvent || {};
-    observe({ ...observed, sessionId: result.sessionId || job.sessionId,
+    observe({ ...observed, agent: job.agent, sessionId: result.sessionId || job.sessionId,
       cwd: job.cwd, provider: job.provider, model: job.model, limitId: job.limitId,
       turnId: observed.turnId || job.id, kind: result.kind || 'failed', at: now(),
       source: 'executor', message: result.message || '' });
@@ -220,10 +238,12 @@ function createCodexAutomation(deps = {}) {
     try {
       for (const job of state.jobs) {
         if (!PENDING.has(job.status)) continue;
+        if (deps.isAgentEnabled && !deps.isAgentEnabled(job.agent)) continue;
         const rule = state.rules.find(r => r.id === job.ruleId);
         if (!rule || !rule.enabled) { job.status = 'cancelled'; commit(); continue; }
         if (now() - job.createdAt > 7 * 86400000) { job.status = 'cancelled'; job.message = '动作已过期 / Action expired'; commit(); continue; }
         if (job.status === 'waiting_quota') {
+          if (job.agent !== 'codex') continue;
           const quota = state.quotas[quotaKey(job.provider, job.limitId)];
           if (!quotaAvailable(quota, job.blockedAt, now())) continue;
           job.status = 'scheduled';
@@ -237,12 +257,12 @@ function createCodexAutomation(deps = {}) {
         }
         if (deps.flushStatus) deps.flushStatus();
         if (!PENDING.has(job.status)) continue;
-        const session = sessions.get(job.sessionId);
+        const session = sessions.get(sessionKey(job.agent, job.sessionId));
         const sessionBusy = session && ['running', 'waiting_input', 'unknown', 'error_observed'].includes(session.kind);
         const anyBusy = [...sessions.values()].some(s => ['running', 'waiting_input', 'unknown', 'error_observed'].includes(s.kind));
         const busy = job.action === 'shutdown'
           ? job.onlyWhenIdle && (anyBusy || running.size > 0 || deps.isBusy && deps.isBusy())
-          : running.has(job.sessionId) || sessionBusy;
+          : running.has(sessionKey(job.agent, job.sessionId)) || sessionBusy;
         if (busy) { if (job.status !== 'waiting_idle') { job.status = 'waiting_idle'; commit(); } continue; }
         // A deferred shutdown gets a fresh cancellation window after work ends.
         if (job.status === 'waiting_idle' && job.action === 'shutdown') {
@@ -251,9 +271,9 @@ function createCodexAutomation(deps = {}) {
         // Do not block the scheduler/cancel UI while a CLI turn runs.
         execute(job).catch(err => { loadError = `执行记录失败 / Execution journal failed: ${text(err.message, 200)}`; onChange(); });
       }
-      if (state.jobs.some(j => j.status === 'waiting_quota')
-          || state.rules.some(r => r.enabled && r.trigger === 'quota_restored' && (state.counts[r.id] || 0) < r.maxRuns
-            && sessions.get(r.sessionId)?.kind === 'quota_exhausted')) {
+      if ((!deps.isAgentEnabled || deps.isAgentEnabled('codex')) && (state.jobs.some(j => j.agent === 'codex' && j.status === 'waiting_quota')
+          || state.rules.some(r => r.agent === 'codex' && r.enabled && r.trigger === 'quota_restored' && (state.counts[r.id] || 0) < r.maxRuns
+            && sessions.get(sessionKey(r.agent, r.sessionId))?.kind === 'quota_exhausted'))) {
         if (now() - queryAt >= 60000) refreshQuotas();
       }
     } finally { ticking = false; }
@@ -263,4 +283,4 @@ function createCodexAutomation(deps = {}) {
     stop() { stopped = true; clearInterval(timer); timer = null; } };
 }
 
-module.exports = { createCodexAutomation, normalizeRule, powerOff, TRIGGERS, ACTIONS, DEFAULT_PROMPT };
+module.exports = { createCodexAutomation, createAgentAutomation: createCodexAutomation, normalizeRule, powerOff, TRIGGERS, ACTIONS, AGENTS, DEFAULT_PROMPT };

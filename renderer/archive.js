@@ -64,9 +64,9 @@ Object.assign(COPY.ja, {
 });
 
 for (const [locale, title, subtitle] of [
-  ['zh', '任务自动化', '为 Codex 会话配置触发条件、动作和执行限制'],
-  ['en', 'Task automation', 'Configure triggers, actions and limits for Codex sessions'],
-  ['ja', 'タスク自動化', 'Codex セッションの条件・アクション・実行上限を設定'],
+  ['zh', '任务自动化', '为 Codex、Claude 和 DSH 配置触发条件、动作和执行限制'],
+  ['en', 'Task automation', 'Configure triggers, actions and limits for Codex, Claude and DSH'],
+  ['ja', 'タスク自動化', 'Codex・Claude・DSH の条件・アクション・実行上限を設定'],
 ]) { COPY[locale].pages.automation = [title, subtitle]; COPY[locale].nav.push(title); }
 
 let lang = 'zh'; let config = { sessionArchive: {} }; let page = localStorage.getItem('llmpet-workbench-page') || 'dashboard';

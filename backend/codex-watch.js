@@ -38,8 +38,9 @@ const { detectEmotion } = require('./emotion');
 const { promptTitle } = require('./transcript');
 const { createCodexSessionIndex, DEFAULT_PATH: DEFAULT_SESSION_INDEX_PATH } = require('./codex-session-index');
 const { classifyError, normalizeQuota } = require('./codex-status');
+const { activityTime } = require('./session-activity');
 
-const SESSIONS_DIR = path.join(os.homedir(), '.codex', 'sessions');
+const SESSIONS_DIR = path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'sessions');
 const POLL_MS = 2500;
 const BACKFILL_MAX_AGE_MS = 30 * 60 * 1000; // 与 core 的 backfill 窗口对齐
 const IDLE_UNTRACK_MS = 60 * 60 * 1000;     // 文件超过 1h 没动 → 不再跟踪（再动会重新发现）
@@ -263,6 +264,7 @@ function createCodexWatch(deps) {
 
   /** @type {Map<string, object>} file path → tracker */
   const trackers = new Map();
+  const activityCache = new Map();
   // 已见文件的增量游标。长寿会话可能静默 1h 后重新写入；只删 tracker 而不保留
   // offset，会把整份 rollout 当成新会话从头重放，触发旧欢迎/完成/气泡风暴。
   // 启动首轮也会记录所有历史文件的 EOF，使旧会话再次活跃时只吃新增内容。
@@ -277,14 +279,14 @@ function createCodexWatch(deps) {
     const p = obj.payload || {};
     if (p.turn_id) t.turnId = String(p.turn_id);
     onStatus({ sessionId: t.sid, turnId: t.turnId || '', kind, at: Date.parse(obj.timestamp) || Date.now(),
-      cwd: t.cwd || '', title: t.sessionTitle || '', provider: t.provider || '', model: t.model || '',
+      agent: 'codex', cwd: t.cwd || '', title: t.sessionTitle || '', provider: t.provider || '', model: t.model || '',
       transcriptPath: t.fp, limitId: t.limitId || 'codex', source: 'rollout', ...extra });
   }
   function reportQuota(t, raw, at, seed = false) {
     const quota = normalizeQuota(raw, at);
     if (!quota) return;
     t.limitId = quota.limitId;
-    onQuota({ ...quota, provider: t.provider || '',
+    onQuota({ ...quota, agent: 'codex', provider: t.provider || '',
       providerVerified: t.provider === 'openai' || !!t.provider && quota.quotaProvider === t.provider }, { seed });
   }
 
@@ -306,7 +308,7 @@ function createCodexWatch(deps) {
   function statEntry(fp) {
     try {
       const st = fs.statSync(fp);
-      return { fp, size: st.size, mtimeMs: st.mtimeMs };
+      return { fp, size: st.size, mtimeMs: activityTime(fp, st, activityCache) };
     } catch { return null; }
   }
 
@@ -1000,6 +1002,10 @@ function createCodexWatch(deps) {
         continue;
       } // subagent：光标跟上即可
       pump(t, e.size);
+      if (t.sid && !t.ignored && e.mtimeMs > (t.lastActivityAt || 0) && typeof core.setSessionMeta === 'function') {
+        core.setSessionMeta(t.sid, { transcriptActiveAt: e.mtimeMs });
+        t.lastActivityAt = e.mtimeMs;
+      }
     }
     booted = true;
   }
@@ -1018,6 +1024,7 @@ function createCodexWatch(deps) {
 
   return {
     start, stop, tick, seedRecent, getRateLimits: () => rateLimits,
+    diagnostics: () => ({ agent: 'codex', path: sessionsDir, exists: fs.existsSync(sessionsDir), tracked: [...trackers.values()].filter(t => !t.ignored).length }),
     _trackers: trackers, _cursors: cursors, _sessionIndex: sessionIndex,
   };
 }
