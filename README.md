@@ -193,7 +193,7 @@ dsh web / dsh --profile … ──写会话日志──► ~/.dsh/sessions/--项
 - 至少安装并使用过一个受支持的 agent：[Claude Code](https://claude.com/claude-code)、[OpenAI Codex](https://github.com/openai/codex) 或 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 
 ```bash
-git clone https://github.com/myunwang/LLMPET.git
+git clone https://github.com/EstusFlask/LLMPET
 cd LLMPET
 npm ci               # 按 package-lock.json 安装（国内网络慢可加：ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/ npm ci）
 npm start            # 启动桌宠（首次启动会注册 Claude Code 钩子）
