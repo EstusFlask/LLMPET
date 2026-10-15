@@ -2,6 +2,12 @@
 
 [简体中文](README.md) | [English](README_EN.md) | [日本語](README_JA.md)
 
+## 本 fork 的增强
+
+基于 [myunwang/LLMPET](https://github.com/myunwang/LLMPET)，本分支加入 **Codex 任务自动化**：持久化规则和任务队列、结束/额度等触发条件、按额度等待与有界重试，以及工作台中的规则、队列和历史管理。执行行为由用户配置的规则决定。完整配置与触发语义见 [Codex 自动化说明](docs/codex-automation.md)。
+
+上游徽章、致谢与多语言文档保留原项目来源；本分支的自动化实现见 `backend/codex-automation.js`。
+
 <p align="center">
   <a href="https://github.com/myunwang/LLMPET/stargazers"><img src="https://img.shields.io/github/stars/myunwang/LLMPET?style=for-the-badge&amp;logo=github&amp;label=Stars&amp;labelColor=2d2735&amp;color=ee7348" alt="GitHub Stars"></a>
   <a href="https://github.com/myunwang/LLMPET/forks"><img src="https://img.shields.io/github/forks/myunwang/LLMPET?style=for-the-badge&amp;logo=github&amp;label=Forks&amp;labelColor=2d2735&amp;color=8a5b88" alt="GitHub Forks"></a>

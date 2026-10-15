@@ -2,6 +2,10 @@
 
 [简体中文](README.md) | **English** | [日本語](README_JA.md)
 
+## Enhancements in this fork
+
+Based on [myunwang/LLMPET](https://github.com/myunwang/LLMPET). This fork adds **Codex task automation** with persistent rules, queued jobs, terminal/quota triggers, quota-aware waiting, bounded retries, and a Workbench page for rules, jobs, and history. Actions follow the rules configured by the user. See the [automation guide](docs/codex-automation.md) for configuration and trigger semantics; implementation starts in `backend/codex-automation.js`. Upstream credits and documentation are retained below.
+
 LLMPET is a **local-first multi-agent workspace with a desktop pet as its front door**. It brings **Claude Code, OpenAI Codex, and DeepSeek Harness** into one desktop layer where you can watch live state, find and reopen sessions, manage local history, and hand work from one agent to another.
 
 The pet remains the most immediate interface: it reacts while an agent is thinking, using tools, waiting for you, finishing, failing, or resting, and it surfaces the latest reply in a speech bubble. LLMPET now goes beyond observation with unified session management, cross-agent takeover, a local archive and optional backup, usage diagnostics, and explicit user-triggered agent actions.
