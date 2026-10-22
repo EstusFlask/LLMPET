@@ -3,6 +3,7 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { StringDecoder } = require('string_decoder');
 const { findCli } = require('./launch');
 const { classifyError, normalizeQuota } = require('./codex-status');
 
@@ -52,15 +53,11 @@ function readAccountQuotas(deps = {}) {
           if (!account) { finish({ ok: false, message: '非 ChatGPT 登录；等待匹配的会话额度快照 / Waiting for matching rollout quota' }); return; }
           request('config/read', { includeLayers: false }, cfg => {
             provider = cfg.config && cfg.config.model_provider || 'openai';
-            if (provider !== 'openai') {
-              finish({ ok: false, provider, message: '自定义提供商：ChatGPT 额度不能确认其恢复，等待来源会话的新额度数据 / Custom provider: waiting for its own fresh quota data' });
-              return;
-            }
             request('account/rateLimits/read', {}, limits => {
               const raw = limits.rateLimitsByLimitId || (limits.rateLimits ? { codex: limits.rateLimits } : {});
               const quotas = Object.entries(raw).map(([id, value]) => normalizeQuota({ ...value, limitId: value.limitId || id }))
-                .filter(Boolean).map(q => ({ ...q, provider, providerVerified: true, source: 'account' }));
-              finish({ ok: quotas.length > 0, provider, quotas, message: quotas.length ? '' : '未返回额度窗口 / No quota windows returned' });
+                .filter(Boolean).map(q => ({ ...q, provider: 'openai', providerVerified: true, source: 'account' }));
+              finish({ ok: quotas.length > 0, provider: 'openai', inferenceProvider: provider, quotas, message: quotas.length ? '' : '未返回额度窗口 / No quota windows returned' });
             });
           });
         });
@@ -82,7 +79,8 @@ function createCodexExecutor(deps = {}) {
     // No approval/sandbox bypass flags. A resumed CLI uses its configured
     // provider and policies; unsupported approvals fail visibly.
     return new Promise(resolve => {
-      let child, carry = '', threadId = job.sessionId, completed = false, failure = null, settled = false;
+      let child, carry = '', stderr = '', threadId = job.sessionId, completed = false, failure = null, settled = false;
+      const decoder = new StringDecoder('utf8'), errorDecoder = new StringDecoder('utf8');
       const finish = result => { if (settled) return; settled = true; children.delete(child); resolve({ ...result, sessionId: threadId }); };
       function line(text) {
         let event; try { event = JSON.parse(text); } catch { return; }
@@ -93,20 +91,27 @@ function createCodexExecutor(deps = {}) {
         if (event.type === 'turn.started') failure = null;
       }
       try {
-        child = spawnCodex(args, { cwd: job.cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'], env: { ...process.env, LLMPET_AUTOMATION: '1' } }, deps);
+        child = spawnCodex(args, { cwd: job.cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, LLMPET_AUTOMATION: '1' } }, deps);
         children.add(child);
         child.on('error', err => finish({ ok: false, kind: 'failed', message: err.code === 'ENOENT'
           ? '找不到 Codex CLI。请检查 Codex 安装，再重新设置执行时间 / Codex CLI not found; check installation, then reschedule'
           : String(err.message).slice(0, 500) }));
         child.stdin.on('error', () => {});
         child.stdout.on('data', chunk => {
-          carry += chunk.toString('utf8');
+          carry += decoder.write(chunk);
           let nl; while ((nl = carry.indexOf('\n')) >= 0) { line(carry.slice(0, nl)); carry = carry.slice(nl + 1); }
           if (carry.length > 2 * 1024 * 1024) carry = '';
         });
+        child.stderr?.on('data', chunk => { stderr = (stderr + errorDecoder.write(chunk)).slice(-16000); });
         child.on('close', code => {
+          carry += decoder.end(); stderr += errorDecoder.end();
           if (carry) line(carry);
+          const diagnostic = stderr.replace(/\x1b\[[0-9;]*m/g, '').replace(/(authorization\s*[:=]\s*)[^\r\n]+/gi, '$1<REDACTED>')
+            .replace(/Bearer\s+[^\s,;]+/gi, 'Bearer <REDACTED>').replace(/((?:api[\s_-]?key|(?:access[_-]?|refresh[_-]?)?token)\s*[:=]\s*)[^\s,;]+/gi, '$1<REDACTED>')
+            .replace(/sk-[A-Za-z0-9_-]{12,}/g, '<REDACTED>').split(/\r?\n/).filter(l => l.trim() && !/\bWARN\b/.test(l)).slice(-5).join('\n').slice(-1600);
           if (code === 0 && completed) finish({ ok: true, kind: 'completed' });
+          else if (/already has an active writer|thread-store conflict/i.test(diagnostic || failure?.message || '')) finish({ ok: false, kind: 'session_busy', message: `会话正被 Codex 桌面端或其他进程占用；释放后自动重试，也可在原会话继续 / Waiting for the session writer to release\n${diagnostic || failure.message}` });
+          else if (diagnostic && !failure?.message) finish({ ok: false, ...classifyError({ message: diagnostic }) });
           else finish({ ok: false, ...(failure || { kind: 'failed', message: `Codex 退出，结果未确认 / Unconfirmed outcome (exit ${code})` }) });
         });
         child.stdin.end(job.prompt);
