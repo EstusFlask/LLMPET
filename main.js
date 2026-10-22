@@ -46,7 +46,6 @@ const { launchClaude, launchCodex, launchDsh, ensureDshWeb, launchExecutable, fi
 const { createAgentStartup } = require('./backend/agent-startup');
 const { createCodexWatch } = require('./backend/codex-watch');
 const { createAgentAutomation } = require('./backend/codex-automation');
-const { readAccountQuotas } = require('./backend/codex-control');
 const { createAgentExecutor } = require('./backend/agent-control');
 const { createClaudeActivityAdapter } = require('./backend/agent-events');
 const { createDshWatch } = require('./backend/dsh-watch');
@@ -1034,8 +1033,13 @@ function automationSnapshot() {
   const choices = new Map(value.sessions.map(s => [`${s.agent}:${s.sessionId}`, s]));
   for (const s of sessionArchive ? sessionArchive.list({ pageSize: 100 }).sessions : []) {
     const key = `${s.provider}:${s.id}`;
-    if (!choices.has(key)) choices.set(key, { agent: s.provider, sessionId: s.id, title: s.title, cwd: s.cwd, kind: 'history', at: s.updatedAt });
+    const live = choices.get(key);
+    choices.set(key, { agent: s.provider, sessionId: s.id, cwd: s.cwd, provider: s.modelProvider, model: s.model, kind: 'history', at: s.updatedAt, ...live, title: s.title || live?.title });
   }
+  value.rules = value.rules.map(rule => {
+    const source = choices.get(`${rule.agent}:${rule.sessionId}`) || sessionArchive?.get(`${rule.agent}:${rule.sessionId}`);
+    return { ...rule, sessionTitle: source?.title || rule.sessionTitle || '' };
+  });
   value.choices = [...choices.values()];
   value.diagnostics = {
     sourceRoot: __dirname, executable: process.execPath, loadedAt: backendLoadedAt, configPath: config.CONFIG_PATH,
@@ -1124,9 +1128,6 @@ function bootBackend() {
     run: (job, onThread) => process.env.OCTOPUS_NO_NET === '1'
       ? Promise.resolve({ ok: false, kind: 'failed', message: '离线模式禁止自动任务联网 / Offline mode blocks automated inference' })
       : codexExecutor.run(job, onThread),
-    readQuotas: () => process.env.OCTOPUS_NO_NET === '1'
-      ? Promise.resolve({ ok: false, message: '离线模式不查询账号额度 / Offline mode disables account quota checks' })
-      : readAccountQuotas(),
     flushStatus: () => { if (codexWatch) codexWatch.tick(); if (dshWatch) dshWatch.tick(); },
     isBusy: () => [...core.sessions.values()].some(s =>
       ['working', 'thinking', 'juggling', 'sweeping', 'carrying', 'notification'].includes(s.state)),
@@ -1145,7 +1146,6 @@ function bootBackend() {
     codexWatch = createCodexWatch({
       core,
       onStatus: (event) => codexAutomation.observe(event),
-      onQuota: (quota, options) => codexAutomation.observeQuota(quota, options),
       // 开发/E2E 可用 LLMPET_CODEX_DIR 指到假目录，不碰真实 ~/.codex
       sessionsDir: process.env.LLMPET_CODEX_DIR || undefined,
     });
@@ -1315,11 +1315,18 @@ function registerIpc() {
     if (sessionArchive) sessionArchive.refresh().then(() => sendArchive('automation:changed', automationSnapshot())).catch(() => {});
     return true;
   }));
-  ipcMain.handle('automation-save', (e, rule) => automationCall(e, () => codexAutomation.saveRule(rule)));
+  ipcMain.handle('automation-save', (e, rule) => automationCall(e, () => {
+    const source = automationSnapshot().choices.find(s => s.agent === (rule.agent || 'codex') && s.sessionId === rule.sessionId)
+      || sessionArchive?.get(`${rule.agent || 'codex'}:${rule.sessionId}`);
+    return codexAutomation.saveRule({ ...rule,
+      sessionTitle: source?.title || rule.sessionTitle,
+      sessionCwd: source?.cwd || rule.sessionCwd,
+      sessionProvider: (source?.sessionId ? source.provider : source?.modelProvider) || rule.sessionProvider,
+      sessionModel: source?.model || rule.sessionModel });
+  }));
   ipcMain.handle('automation-remove', (e, id) => automationCall(e, () => codexAutomation.removeRule(id)));
   ipcMain.handle('automation-reset', (e, id) => automationCall(e, () => codexAutomation.resetCount(id)));
   ipcMain.handle('automation-cancel', (e, id) => automationCall(e, () => codexAutomation.cancelJob(id)));
-  ipcMain.handle('automation-refresh-quota', e => automationCall(e, () => { codexAutomation.refreshQuotas(); return true; }));
   ipcMain.handle('get-stats', (e) => {
     // Do not return a stale cached price/token snapshot to a newly opened
     // dashboard. buildStats is read-only and reflects the latest ledger scan.
