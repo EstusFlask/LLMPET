@@ -12,7 +12,8 @@ function spawnAgent(name, args, options = {}, deps = {}) {
   if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(cli)) {
     const quote = s => `'${String(s).replace(/'/g, "''")}'`;
     const script = `& ${[cli, ...args].map(quote).join(' ')}; exit $LASTEXITCODE`;
-    return spawnImpl('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], options);
+    const powershell = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    return spawnImpl(powershell, ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], options);
   }
   return spawnImpl(cli, args, options);
 }
@@ -94,7 +95,9 @@ function createCodexExecutor(deps = {}) {
       try {
         child = spawnCodex(args, { cwd: job.cwd, windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'], env: { ...process.env, LLMPET_AUTOMATION: '1' } }, deps);
         children.add(child);
-        child.on('error', err => finish({ ok: false, kind: 'failed', message: String(err.message).slice(0, 500) }));
+        child.on('error', err => finish({ ok: false, kind: 'failed', message: err.code === 'ENOENT'
+          ? '找不到 Codex CLI。请检查 Codex 安装，再重新设置执行时间 / Codex CLI not found; check installation, then reschedule'
+          : String(err.message).slice(0, 500) }));
         child.stdin.on('error', () => {});
         child.stdout.on('data', chunk => {
           carry += chunk.toString('utf8');
