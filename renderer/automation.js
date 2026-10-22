@@ -61,6 +61,10 @@
   };
   for (const [lang, extra] of Object.entries(quotaWords)) {
     Object.assign(words[lang], extra); Object.assign(words[lang].triggers, { quota_5h_restored: extra.quota5h, quota_weekly_restored: extra.quotaWeek });
+    words[lang].routing = { zh: 'Codex 桌面端运行时使用桌面原生发送；未运行时使用 CLI。桌面通道暂不可用时等待重试。', en: 'Codex uses native desktop messaging while the app runs, otherwise CLI. An unavailable desktop channel waits and retries.', ja: 'Codex 起動中はデスクトップ経由、未起動時は CLI で送信します。デスクトップ接続が未準備の場合は待機します。' }[lang];
+    words[lang].desktopRoute = { zh: '桌面原生', en: 'Native desktop', ja: 'デスクトップ' }[lang];
+    words[lang].states.waiting_desktop = { zh: '等待桌面发送通道', en: 'Waiting for desktop messaging', ja: 'デスクトップ接続待ち' }[lang];
+    words[lang].states.unconfirmed = { zh: '提交或完成状态未确认', en: 'Submission or completion unconfirmed', ja: '送信・完了は未確認' }[lang];
     words[lang].states.waiting_session = { zh: '等待会话释放写入锁', en: 'Waiting for the session writer', ja: '会話の書き込みロック解除待ち' }[lang];
     words[lang].events.count_reset = { zh: '次数已重置', en: 'Count reset', ja: '回数をリセット' }[lang];
     words[lang].runs = { zh: '成功完成', en: 'Completed successfully', ja: '成功した回数' }[lang];
@@ -105,6 +109,7 @@
       <label>${esc(w.agent)}<select id="auto-agent"><option value="codex">Codex</option><option value="claude">Claude Code</option><option value="dsh">DSH</option></select></label>
       <label>${esc(w.session)}<input id="auto-session" list="auto-sessions" required autocomplete="off"><datalist id="auto-sessions"></datalist><small id="auto-session-title"></small></label>
       <label>${esc(w.trigger)}<select id="auto-trigger">${options(w.triggers)}</select></label>
+      <small id="auto-routing-note">${esc(w.routing)}</small>
       <small id="auto-quota-note" hidden>${esc(w.quotaNote)}</small>
       <label id="auto-time-field" hidden>${esc(w.at)} · ${esc(Intl.DateTimeFormat().resolvedOptions().timeZone)}<input id="auto-time" type="datetime-local" step="1"><small>${esc(w.atNote)}</small></label>
       <label>${esc(w.action)}<select id="auto-action" required><option value="">${esc(w.chooseAction)}</option>${options(w.actions)}</select></label>
@@ -130,6 +135,7 @@
   }
   function actionChanged() {
     const codex = el('agent').value === 'codex';
+    el('routing-note').hidden = !codex;
     for (const option of el('trigger').options) if (option.value.startsWith('quota_')) option.hidden = option.disabled = !codex;
     if (!codex && el('trigger').value.startsWith('quota_')) el('trigger').value = 'scheduled';
     el('quota-note').hidden = !el('trigger').value.startsWith('quota_');
@@ -214,7 +220,7 @@
     setHTML('rules', state.rules.map(r => `<div class="automation-item ${r.enabled ? '' : 'automation-muted'}"><strong>${esc(r.name)}</strong><p>${esc(w.triggers[r.trigger] || r.trigger)} → ${esc(w.actions[r.action] || r.action)}</p><small class="automation-task-title">${esc(w.taskTitle)}: ${esc(r.sessionTitle || (state.choices || state.sessions).find(s => (s.agent || 'codex') === r.agent && s.sessionId === r.sessionId)?.title || w.untitled)}</small>${r.trigger === 'scheduled' ? `<small>${esc(w.at)}: ${esc(date(r.scheduledAt))}</small>` : ''}${(state.attempts?.[r.id] || 0) >= r.maxRuns && (state.counts[r.id] || 0) < r.maxRuns ? `<p>${esc(w.attemptsReached)}</p>` : ''}${r.needsSchedule ? `<p class="automation-countdown">${esc(w.needsSchedule)}</p>` : ''}<small>${esc(agentName(r.agent))} · ${esc(r.sessionId)} · ${esc(w.runs)} ${state.counts[r.id] || 0}/${r.maxRuns}</small><div class="automation-actions">${button('edit', r.id, w.edit)}${button('reselect', r.id, w.reselect)}${button('toggle', r.id, r.enabled ? w.disable : w.enable)}${button('reset', r.id, w.reset)}${button('remove', r.id, w.remove)}</div></div>`).join('') || empty);
     setHTML('jobs', state.jobs.slice(0, 25).map(j => {
       const countdown = j.status === 'scheduled' ? `<p class="automation-countdown">${Math.max(0, Math.ceil((j.dueAt - Date.now()) / 1000))} ${esc(w.remaining)}</p>` : '';
-      return `<div class="automation-item"><strong>${esc(j.ruleName)} · ${esc(w.states[j.status] || j.status)}</strong><small>${esc(w.actions[j.action])} · ${esc(date(j.createdAt))}</small>${countdown}${j.message ? `<p>${esc(j.message)}</p>` : ''}${j.status === 'waiting_session' && j.agent === 'codex' ? button('open-session', j.id, w.openSession) : ''}${['scheduled', 'waiting_idle', 'waiting_session'].includes(j.status) ? button('cancel', j.id, w.cancel) : ''}</div>`;
+      return `<div class="automation-item"><strong>${esc(j.ruleName)} · ${esc(w.states[j.status] || j.status)}</strong><small>${esc(w.actions[j.action])}${j.executorRoute ? ` · ${esc(j.executorRoute === 'desktop' ? w.desktopRoute : 'CLI')}` : ''} · ${esc(date(j.createdAt))}</small>${countdown}${j.message ? `<p>${esc(j.message)}</p>` : ''}${['waiting_session', 'waiting_desktop'].includes(j.status) && j.agent === 'codex' ? button('open-session', j.id, w.openSession) : ''}${['scheduled', 'waiting_idle', 'waiting_session', 'waiting_desktop'].includes(j.status) ? button('cancel', j.id, w.cancel) : ''}</div>`;
     }).join('') || empty);
     el('quota-refresh').disabled = !!state.queryBusy;
     el('quota-refresh').textContent = state.queryBusy ? w.quotaLoading : w.refreshQuota;

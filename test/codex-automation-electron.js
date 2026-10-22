@@ -74,7 +74,7 @@ if (!process.versions.electron) {
   require('electron').clipboard.writeText = value => { copiedPrompts.push(value); };
   const automationModule = require('../backend/codex-automation'), createAutomation = automationModule.createAgentAutomation;
   automationModule.createAgentAutomation = deps => createAutomation({ ...deps, run: (job, cb) => job.prompt === 'UI_BUSY_WRITER'
-    ? Promise.resolve({ ok: false, kind: 'session_busy', message: 'Fixture active writer' }) : deps.run(job, cb) });
+    ? Promise.resolve({ ok: false, kind: 'session_busy', executorRoute: 'desktop', message: 'Fixture active writer' }) : deps.run(job, cb) });
   app.on('web-contents-created', (_event, wc) => wc.on('console-message', (_e, level, message) => {
     if (level === 3 && !message.includes('Content Security Policy')) errors.push(message);
   }));
@@ -224,7 +224,7 @@ if (!process.versions.electron) {
     await win.webContents.executeJavaScript(`(async()=>{
       const s=(await window.pet.getAutomation()).value,j=s.jobs.find(j=>j.status==='waiting_session');
       if((s.counts[j.ruleId]||0)!==0||(s.attempts[j.ruleId]||0)!==0)throw Error('Writer lock must not consume counts');
-      const b=document.querySelector('[data-auto="open-session"][data-id="'+j.id+'"]');if(!b)throw Error('Open original session action missing');b.click();
+      const b=document.querySelector('[data-auto="open-session"][data-id="'+j.id+'"]');if(!b)throw Error('Open original session action missing');if(!document.getElementById('auto-jobs').textContent.includes('桌面原生'))throw Error('Selected desktop route is missing');b.click();
       await new Promise(r=>setTimeout(r,150));await window.pet.cancelAutomationJob(j.id);
     })()`);
     assert(openedSessions.includes(`codex://threads/${sid}`)); assert(copiedPrompts.includes('UI_BUSY_WRITER'));

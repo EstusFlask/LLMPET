@@ -44,7 +44,7 @@ function fakeChild() { const child = new EventEmitter(); child.stdin = new PassT
   }
   {
     const child = fakeChild(); child.stderr = new PassThrough();
-    const e = createCodexExecutor({ findCli: () => 'codex.exe', spawn: () => child });
+    const e = createCodexExecutor({ desktop: false, findCli: () => 'codex.exe', spawn: () => child });
     const result = e.run({ action: 'continue', sessionId: SID, cwd: root, prompt: 'test' });
     child.stderr.write(`Error: thread ${SID} already has an active writer\n`); child.emit('close', 1);
     const value = await result;
@@ -53,7 +53,7 @@ function fakeChild() { const child = new EventEmitter(); child.stdin = new PassT
   }
   {
     const child = fakeChild(); child.stderr = new PassThrough();
-    const e = createCodexExecutor({ findCli: () => 'codex.exe', spawn: () => child });
+    const e = createCodexExecutor({ desktop: false, findCli: () => 'codex.exe', spawn: () => child });
     const result = e.run({ action: 'continue', sessionId: SID, cwd: root, prompt: 'test' });
     child.stderr.write('Error: authentication failed\nAuthorization: Bearer secret-header\nAPI key=secret-key\n'); child.emit('close', 1);
     const value = await result;
@@ -89,6 +89,22 @@ function fakeChild() { const child = new EventEmitter(); child.stdin = new PassT
     f.rule({ trigger: 'scheduled', scheduledAt: time + 1000 }); time += 1000; await f.engine.tick(); await settle();
     f.event({ kind: 'running' });
     assert.strictEqual(f.engine.snapshot().jobs[0].status, 'cancelled', 'manual continuation supersedes the queued writer retry');
+  }
+  {
+    let available = false;
+    const f = fixture({ run: async job => available ? { ok: true, kind: 'completed', executorRoute: 'cli', sessionId: job.sessionId }
+      : { ok: false, kind: 'desktop_unavailable', executorRoute: 'desktop', message: 'Bridge not ready' } });
+    const r = f.rule({ trigger: 'scheduled', scheduledAt: time + 1000 }); time += 1000; await f.engine.tick(); await settle();
+    assert.strictEqual(f.engine.snapshot().jobs[0].status, 'waiting_desktop'); assert.strictEqual(f.engine.snapshot().jobs[0].executorRoute, 'desktop');
+    assert.strictEqual(f.engine.snapshot().attempts[r.id], 0);
+    available = true; time += 30000; await f.engine.tick(); await settle();
+    assert.strictEqual(f.engine.snapshot().counts[r.id], 1); assert.strictEqual(f.engine.snapshot().jobs[0].executorRoute, 'cli');
+  }
+  {
+    const f = fixture({ run: async () => ({ ok: false, kind: 'submission_unknown', executorRoute: 'desktop', message: 'Check the original chat' }) });
+    f.rule({ trigger: 'ended', maxRuns: 3 }); f.event({ kind: 'completed' }); await f.engine.tick(); await settle();
+    assert.strictEqual(f.engine.snapshot().jobs[0].status, 'unconfirmed'); assert.strictEqual(f.engine.snapshot().sessions[0].kind, 'unknown');
+    await f.engine.tick(); assert.strictEqual(f.engine.snapshot().jobs.length, 1, 'an uncertain native submission must never auto-repeat');
   }
   {
     const f = fixture(); const r = f.rule({ trigger: 'quota_5h_restored', sessionCwd: root, sessionProvider: 'custom', maxRuns: 1 });
@@ -273,13 +289,13 @@ function fakeChild() { const child = new EventEmitter(); child.stdin = new PassT
   }
   {
     const child = fakeChild(); let args;
-    const executor = createCodexExecutor({ findCli: () => 'codex.exe', spawn: (_bin, a) => { args = a; return child; } });
+    const executor = createCodexExecutor({ desktop: false, findCli: () => 'codex.exe', spawn: (_bin, a) => { args = a; return child; } });
     const promise = executor.run({ sessionId: SID, action: 'continue', cwd: root, provider: 'original', prompt: 'hello' });
     child.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: SID }) + '\n');
     child.stdout.write(JSON.stringify({ type: 'turn.failed', error: { message: 'usage limit reached' } }) + '\n'); child.emit('close', 1);
     const result = await promise; assert(!result.ok); assert.strictEqual(result.kind, 'quota_exhausted');
     assert(args.includes(`model_provider="original"`)); assert(!args.some(a => /dangerously|bypass/.test(a)));
-    const missing = fakeChild(); const other = createCodexExecutor({ findCli: () => 'codex.exe', spawn: () => missing });
+    const missing = fakeChild(); const other = createCodexExecutor({ desktop: false, findCli: () => 'codex.exe', spawn: () => missing });
     const missingResult = other.run({ sessionId: SID, action: 'continue', cwd: root, prompt: 'x' }); missing.emit('close', 0);
     assert(!(await missingResult).ok, 'launch and zero exit alone cannot prove successful completion');
   }

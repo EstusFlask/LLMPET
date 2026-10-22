@@ -10,7 +10,7 @@ const QUOTA_TRIGGERS = { quota_5h_restored: 300, quota_weekly_restored: 10080 };
 const TRIGGERS = [...Object.keys(QUOTA_TRIGGERS), 'scheduled', 'completed', 'ended', 'transient_error', 'failed', 'interrupted'];
 const ACTIONS = ['continue', 'new_task', 'shutdown'];
 const TERMINAL = new Set(['completed', 'quota_exhausted', 'transient_error', 'failed', 'interrupted']);
-const PENDING = new Set(['scheduled', 'waiting_idle', 'waiting_session']);
+const PENDING = new Set(['scheduled', 'waiting_idle', 'waiting_session', 'waiting_desktop']);
 const text = (v, max = 256) => typeof v === 'string' ? v.trim().slice(0, max) : '';
 const uuid = () => crypto.randomUUID();
 const DEFAULT_PROMPT = '继续原任务。先核对已完成的工作和当前状态，只继续尚未完成的部分；不要重复已经完成的外部操作。';
@@ -244,28 +244,32 @@ function createCodexAutomation(deps = {}) {
     job.status = 'running'; job.startedAt = now(); running.set(sessionKey(job.agent, job.sessionId), job); commit();
     let result;
     try {
-      result = await deps.run(job, id => {
+      result = await deps.run(job, (id, metadata = {}) => {
         if (job.action === 'new_task' && id !== job.sessionId) running.delete(sessionKey(job.agent, job.sessionId));
         running.set(sessionKey(job.agent, id), job); job.targetSessionId = id;
+        if (metadata.executorRoute) { job.executorRoute = metadata.executorRoute; commit(); }
       });
     } catch (err) { result = { ok: false, kind: 'failed', message: String(err.message).slice(0, 500) }; }
     if (deps.flushStatus) deps.flushStatus();
     for (const [id, value] of running) if (value === job) running.delete(id);
-    if (result.kind === 'session_busy' && (job.countEpoch || 0) !== (state.countEpochs[job.ruleId] || 0)) { job.status = 'cancelled'; commit(); return; }
-    if (result.kind === 'session_busy') {
+    if (result.executorRoute) job.executorRoute = result.executorRoute;
+    if (result.desktopTurnId) job.desktopTurnId = result.desktopTurnId;
+    const waiting = ['session_busy', 'desktop_unavailable'].includes(result.kind);
+    if (waiting && (job.countEpoch || 0) !== (state.countEpochs[job.ruleId] || 0)) { job.status = 'cancelled'; commit(); return; }
+    if (waiting) {
       state.attempts[job.ruleId] = Math.max(0, (state.attempts[job.ruleId] || 0) - 1);
-      job.status = 'waiting_session'; job.writerBlocked = true; job.message = result.message || ''; job.retryAt = now() + 30000;
-      log('waiting_session', job.message, { jobId: job.id }); commit(); return;
+      job.status = result.kind === 'desktop_unavailable' ? 'waiting_desktop' : 'waiting_session'; job.writerBlocked = true; job.message = result.message || ''; job.retryAt = now() + 30000;
+      log(job.status, job.message, { jobId: job.id }); commit(); return;
     }
     if (result.ok && (job.countEpoch || 0) === (state.countEpochs[job.ruleId] || 0)) state.counts[job.ruleId] = (state.counts[job.ruleId] || 0) + 1;
-    job.status = result.ok ? 'completed' : 'failed'; job.message = result.message || '';
+    job.status = result.ok ? 'completed' : result.kind === 'submission_unknown' ? 'unconfirmed' : 'failed'; job.message = result.message || '';
     log(job.status, job.message, { jobId: job.id, sessionId: result.sessionId || job.sessionId });
     commit();
     if (stopped) return;
     const observed = job.observedEvent || {};
     observe({ ...observed, agent: job.agent, sessionId: result.sessionId || job.sessionId,
       cwd: job.cwd, provider: job.provider, model: job.model,
-      turnId: observed.turnId || job.id, kind: result.kind || 'failed', at: now(),
+      turnId: result.desktopTurnId || observed.turnId || job.id, kind: result.kind === 'submission_unknown' ? 'unknown' : result.kind || 'failed', at: now(),
       source: 'executor', message: result.message || '' });
   }
   async function tick() {
@@ -281,7 +285,7 @@ function createCodexAutomation(deps = {}) {
         const rule = state.rules.find(r => r.id === job.ruleId);
         if (!rule || !rule.enabled) { job.status = 'cancelled'; commit(); continue; }
         if (now() - job.dueAt > 7 * 86400000) { job.status = 'cancelled'; job.message = '动作已过期 / Action expired'; commit(); continue; }
-        if (job.dueAt > now() || job.status === 'waiting_session' && job.retryAt > now()) continue;
+        if (job.dueAt > now() || ['waiting_session', 'waiting_desktop'].includes(job.status) && job.retryAt > now()) continue;
         if (deps.flushStatus) deps.flushStatus();
         if (!PENDING.has(job.status)) continue;
         const session = sessions.get(sessionKey(job.agent, job.sessionId));

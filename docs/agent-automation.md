@@ -8,7 +8,7 @@
 |---|---|---|---|
 | 正常结束、中断、结束或中断 | rollout 回合事件 | 原生 hook，保留 Stop 完成门 | 原生 turn/start、turn/end 日志 |
 | 已确认失败的原因 | 日志提供明确终止信息时可分类 | 原生 StopFailure、Stop 的最终错误、自动 CLI 的 result；API 重试不冒充终止 | turn/end 的原因；llm/retry 不冒充终止 |
-| 继续原会话 | codex exec resume | claude --print --resume | dsh --profile headless --session-id |
+| 继续原会话 | 桌面运行时原生发送，否则 codex exec resume | claude --print --resume | dsh --profile headless --session-id |
 | 新任务 | 支持 | 支持 | 支持，需安装兼容 headless 的 CLI |
 | 关机 | 支持 | 支持 | 支持 |
 | 指定日期和时间执行一次 | 支持 | 支持 | 支持 |
@@ -20,7 +20,7 @@ Claude 的 Stop 若仍有后台任务、cron 或 stop-hook 续跑，不触发正
 
 ## 动作与限制
 
-- **继续 / 重试**：在原生 session ID 中发送继续指令。指令为空时发送默认指令，仍会产生新消息。
+- **继续 / 重试**：在原生 session ID 中发送继续指令。Codex 自动选择桌面原生或 CLI：桌面运行时向桌面自身的会话服务发送，未运行时才启动 CLI；桌面通道未就绪时等待重试。执行卡片显示当前方式。指令为空时发送默认指令。
 - **开始新任务**：填写必需的任务内容，可指定工作目录；默认使用来源会话目录。
 - **指定时间**：选择本机时区下的日期与时间，到点执行一次，不依赖新日志事件或额度查询。目标会话仍在运行时等待空闲。请保持应用运行。
 - **关机**：至少 60 秒倒计时，可取消。默认等待已观察到的运行中及待回复会话结束。关机不强制关闭未保存的程序。

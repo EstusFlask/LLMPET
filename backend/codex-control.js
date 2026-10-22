@@ -6,6 +6,7 @@ const path = require('path');
 const { StringDecoder } = require('string_decoder');
 const { findCli } = require('./launch');
 const { classifyError, normalizeQuota } = require('./codex-status');
+const { createDesktopExecutor } = require('./codex-desktop');
 
 function spawnAgent(name, args, options = {}, deps = {}) {
   const cli = (deps.findCli || findCli)(name);
@@ -68,9 +69,15 @@ function readAccountQuotas(deps = {}) {
 
 function createCodexExecutor(deps = {}) {
   const children = new Set();
+  const desktop = deps.desktop === false ? null : deps.desktopExecutor || createDesktopExecutor(deps.desktopOptions);
   async function run(job, onThread = () => {}) {
     if (!path.isAbsolute(job.cwd || '') || !fs.existsSync(job.cwd)) return { ok: false, kind: 'failed', message: '工作目录不存在 / Working directory missing' };
     if (job.action !== 'new_task' && !/^[0-9a-f]{8}-[0-9a-f-]{27,40}$/i.test(job.sessionId || '')) return { ok: false, kind: 'failed', message: 'Invalid session ID' };
+    if (desktop) {
+      const result = await desktop.runIfAvailable(job, onThread);
+      if (result) return result;
+    }
+    onThread(job.sessionId, { executorRoute: 'cli' });
     const args = job.action === 'new_task'
       ? ['exec', '--json', '--skip-git-repo-check', '-']
       : ['exec', 'resume', '--json', '--skip-git-repo-check', job.sessionId, '-'];
@@ -81,7 +88,7 @@ function createCodexExecutor(deps = {}) {
     return new Promise(resolve => {
       let child, carry = '', stderr = '', threadId = job.sessionId, completed = false, failure = null, settled = false;
       const decoder = new StringDecoder('utf8'), errorDecoder = new StringDecoder('utf8');
-      const finish = result => { if (settled) return; settled = true; children.delete(child); resolve({ ...result, sessionId: threadId }); };
+      const finish = result => { if (settled) return; settled = true; children.delete(child); resolve({ ...result, sessionId: threadId, executorRoute: 'cli' }); };
       function line(text) {
         let event; try { event = JSON.parse(text); } catch { return; }
         if (event.type === 'thread.started' && event.thread_id) { threadId = event.thread_id; onThread(threadId); }
@@ -118,7 +125,7 @@ function createCodexExecutor(deps = {}) {
       } catch (err) { finish({ ok: false, kind: 'failed', message: String(err.message).slice(0, 500) }); }
     });
   }
-  return { run, stop: () => { for (const child of children) { try { child.kill(); } catch {} } children.clear(); } };
+  return { run, stop: () => { desktop?.stop(); for (const child of children) { try { child.kill(); } catch {} } children.clear(); } };
 }
 
 module.exports = { spawnAgent, spawnCodex, readAccountQuotas, createCodexExecutor };
