@@ -45,6 +45,12 @@ if (!process.versions.electron) {
   const event = payload => JSON.stringify({ type: 'event_msg', timestamp: new Date().toISOString(), payload }) + '\n';
   fs.writeFileSync(rollout, JSON.stringify({ type: 'session_meta', payload: { id: sid, cwd: root, model_provider: 'openai' } }) + '\n'
     + event({ type: 'task_complete', turn_id: 'historical' }));
+  const sid2 = '019f5103-921c-7ac1-9a8d-c4f8ff8a67bb';
+  fs.writeFileSync(path.join(sessions, `rollout-other-${sid2}.jsonl`), JSON.stringify({ type: 'session_meta', payload: { id: sid2, cwd: testDir, model_provider: 'custom' } }) + '\n'
+    + JSON.stringify({ type: 'turn_context', payload: { cwd: testDir, model: 'test-model' } }) + '\n' + event({ type: 'task_complete', turn_id: 'other-history' }));
+  fs.writeFileSync(path.join(testDir, '.codex', 'session_index.jsonl'), [
+    { id: sid, thread_name: 'UI 测试原会话' }, { id: sid2, thread_name: 'UI 测试替换会话' },
+  ].map(x => JSON.stringify(x)).join('\n') + '\n');
   const frozenTime = new Date(Date.now() - 3 * 3600000);
   fs.utimesSync(rollout, frozenTime, frozenTime);
   const claudeId = '019f5103-921c-7ac1-9a8d-c4f8ff8a67cc';
@@ -69,6 +75,7 @@ if (!process.versions.electron) {
     await pet.webContents.executeJavaScript('window.pet.openSessionArchive()');
     const win = await until(() => BrowserWindow.getAllWindows().find(w => w.webContents.getURL().includes('archive.html') && !w.webContents.isLoading()));
     await until(() => win.webContents.executeJavaScript('!!document.getElementById("auto-form")'));
+    await until(() => win.webContents.executeJavaScript('(async()=>{const r=await window.pet.getAutomation();return r.value.choices.some(s=>s.title==="UI 测试替换会话")})()'));
     const result = await win.webContents.executeJavaScript(`(async () => {
       document.querySelector('[data-page="automation"]').click();
       const pause = ms => new Promise(r => setTimeout(r, ms));
@@ -77,17 +84,19 @@ if (!process.versions.electron) {
       const discovered = await window.pet.getAutomation();
       if (!['codex','claude','dsh'].every(agent=>discovered.value.sessions.some(s=>s.agent===agent))) throw Error('Some agent sessions are missing');
       if (!discovered.value.diagnostics.sourceRoot || !document.getElementById('auto-diagnostics').textContent.includes('sessions')) throw Error('Scan diagnostics missing');
-      set('agent', 'claude'); set('trigger', 'quota_exhausted');
-      if (!visible('quota-note') || !document.querySelector('#auto-action [value="continue"]').disabled || !document.querySelector('#auto-trigger [value="quota_restored"]').disabled) throw Error('Unsupported quota capabilities must be explicit');
+      for (const agent of ['codex','claude','dsh']) {
+        set('agent', agent);
+        if (document.querySelector('#auto-trigger [value="quota_exhausted"], #auto-trigger [value="quota_restored"], #auto-action [value="wait_quota"]')) throw Error('Removed quota choices are still offered');
+      }
       set('agent', 'codex'); set('trigger', 'completed');
-      if (document.getElementById('auto-action').value || visible('prompt-field') || visible('cwd-field') || visible('bucket-field') || visible('idle-field') || visible('limits')) throw Error('Action-specific fields visible before selection');
+      if (document.getElementById('auto-action').value || visible('prompt-field') || visible('cwd-field') || visible('idle-field') || visible('limits') || visible('time-field')) throw Error('Action-specific fields visible before selection');
       set('action', 'new_task');
-      if (!visible('prompt-field') || !visible('cwd-field') || visible('idle-field') || visible('bucket-field') || !document.getElementById('auto-prompt').required) throw Error('New task fields incorrect');
+      if (!visible('prompt-field') || !visible('cwd-field') || visible('idle-field') || !document.getElementById('auto-prompt').required) throw Error('New task fields incorrect');
       set('prompt', 'Draft that must not be sent by a shutdown rule'); set('cwd', ${JSON.stringify(root)});
-      set('trigger', 'quota_exhausted'); set('bucket', 'draft-bucket'); set('action', 'continue');
-      if (!visible('prompt-field') || visible('cwd-field') || !visible('bucket-field') || visible('idle-field') || document.getElementById('auto-prompt').required) throw Error('Continuation fields incorrect');
+      set('action', 'continue');
+      if (!visible('prompt-field') || visible('cwd-field') || visible('idle-field') || document.getElementById('auto-prompt').required) throw Error('Continuation fields incorrect');
       set('action', 'shutdown');
-      if (visible('prompt-field') || visible('cwd-field') || visible('bucket-field') || !visible('idle-field') || !visible('limits')) throw Error('Shutdown must hide irrelevant inputs');
+      if (visible('prompt-field') || visible('cwd-field') || !visible('idle-field') || !visible('limits')) throw Error('Shutdown must hide irrelevant inputs');
       set('session', ${JSON.stringify(sid)}); set('name', '任务结束或中断后关机'); set('trigger', 'ended');
       document.getElementById('auto-form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
       await pause(250); const a = await window.pet.getAutomation();
@@ -95,16 +104,32 @@ if (!process.versions.electron) {
       const r = a.value.rules[0];
       if (r.enabled || r.delaySeconds < 60 || r.maxRuns !== 1 || r.trigger !== 'ended') throw Error('Unsafe shutdown defaults or combined trigger missing');
       if (r.prompt || r.cwd || r.limitId) throw Error('Hidden field drafts leaked into the saved shutdown rule');
+      if (r.sessionTitle !== 'UI 测试原会话' || !document.getElementById('auto-rules').textContent.includes('UI 测试原会话')) throw Error('Saved rule must show its task title');
+      if (!document.getElementById('auto-notice').textContent.includes('保存成功')) throw Error('Save success feedback missing');
+      const choose = async id => {
+        document.querySelector('[data-auto="reselect"][data-id="'+r.id+'"]').click();
+        const button = document.querySelector('#auto-live [data-auto="select"][data-id="'+id+'"]');
+        if (!button) throw Error('One-click discovered conversation selection missing');
+        button.click(); await pause(200);
+      };
+      await choose(${JSON.stringify(sid2)});
+      const changed = (await window.pet.getAutomation()).value.rules.find(x=>x.id===r.id);
+      if (changed.sessionId !== ${JSON.stringify(sid2)} || changed.sessionTitle !== 'UI 测试替换会话' || changed.sessionProvider !== 'custom' || changed.sessionModel !== 'test-model') throw Error('Reselection must persist the new conversation and its own model/provider');
+      if (!document.getElementById('auto-notice').textContent.includes('已重新选择对话并保存')) throw Error('Reselection feedback missing');
+      await choose(${JSON.stringify(sid)});
       document.getElementById('auto-clear').click();
-      set('session', ${JSON.stringify(sid)}); set('name', '额度恢复后继续'); set('trigger', 'quota_exhausted'); set('action', 'wait_quota');
-      if (!visible('prompt-field') || !visible('bucket-field') || visible('cwd-field') || visible('idle-field')) throw Error('Wait-for-quota fields incorrect');
+      set('session', ${JSON.stringify(sid)}); set('name', '指定时间继续'); set('trigger', 'scheduled'); set('action', 'continue');
+      const at = Math.floor((Date.now()+3600000)/1000)*1000, d = new Date(at);
+      set('time', new Date(at-d.getTimezoneOffset()*60000).toISOString().slice(0,19));
+      if (!visible('time-field') || !document.getElementById('auto-time').required || visible('limits') || !visible('prompt-field') || visible('cwd-field') || visible('idle-field')) throw Error('Timed continuation fields incorrect');
       document.getElementById('auto-form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
       await pause(250); const b = await window.pet.getAutomation();
-      if (b.value.rules.length !== 2 || b.value.jobs.length) throw Error('Historical events replayed or second action missing');
+      const timerRule = b.value.rules.find(x=>x.trigger==='scheduled');
+      if (b.value.rules.length !== 2 || b.value.jobs.length || timerRule.scheduledAt!==at || timerRule.maxRuns!==1 || timerRule.sessionCwd!==${JSON.stringify(root)}) throw Error('Local execution time or source session did not round trip');
       await window.pet.saveAutomationRule({ ...r, enabled: true });
       return { actions: b.value.rules.map(x => x.action), ruleId: r.id };
     })()`);
-    assert.deepStrictEqual(result.actions, ['shutdown', 'wait_quota']);
+    assert.deepStrictEqual(result.actions, ['shutdown', 'continue']);
     fs.appendFileSync(rollout, event({ type: 'task_started', turn_id: 'live-completion' })
       + event({ type: 'task_complete', turn_id: 'live-completion' }));
     fs.utimesSync(rollout, frozenTime, frozenTime);
@@ -153,7 +178,7 @@ if (!process.versions.electron) {
     win.setSize(920, 700); await pause(150);
     assert(!(await win.webContents.executeJavaScript('document.documentElement.scrollWidth>innerWidth')), 'Narrow workbench must not overflow');
     assert.deepStrictEqual(errors, [], 'Renderer must launch without errors');
-    console.log('LLMPET automation launch passed: Codex/Claude/DSH discovery and rules, frozen-mtime recovery, hook/log triggers, cancellation, conditional fields, diagnostics, zh/en/ja');
+    console.log('LLMPET automation launch passed: Codex/Claude/DSH discovery, rule titles, one-click reselection, success feedback, local schedules, frozen-mtime recovery, hook/log triggers, cancellation, conditional fields, diagnostics, zh/en/ja');
     console.log(`Screenshot: ${path.join(testDir, 'automation.png')}`);
     app.quit();
   })().catch(err => { console.error(err.stack); app.exit(1); });

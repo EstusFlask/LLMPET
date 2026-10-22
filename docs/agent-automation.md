@@ -9,7 +9,7 @@
 | 继续原会话 | codex exec resume | claude --print --resume | dsh --profile headless --session-id |
 | 新任务 | 支持 | 支持 | 支持，需安装兼容 headless 的 CLI |
 | 关机 | 支持 | 支持 | 支持 |
-| 查询并确认额度恢复 | 已接入 ChatGPT 官方账号查询，受提供商归属限制 | 尚无已验证查询接口 | 尚无已验证查询接口 |
+| 指定日期和时间执行一次 | 支持 | 支持 | 支持 |
 
 正常完成不算中断。「任务结束或中断」包括正常完成、主动中断、额度耗尽及其他明确终止。等待回复、内部重连、工具执行失败、日志暂时没有新内容都不算任务结束。
 
@@ -19,14 +19,14 @@ Claude 的 Stop 若仍有后台任务、cron 或 stop-hook 续跑，不触发正
 
 - **继续 / 重试**：在原生 session ID 中发送继续指令。指令为空时发送默认指令，仍会产生新消息。
 - **开始新任务**：填写必需的任务内容，可指定工作目录；默认使用来源会话目录。
-- **等待额度后继续**：目前仅向 Codex 提供。需要新的、归属正确的主次额度窗口数据；到达预计重置时间不会直接恢复。自定义提供商的数据若无法确认归属则保持挂起。
+- **指定时间**：选择本机时区下的日期与时间，到点执行一次，不依赖新日志事件或额度查询。目标会话仍在运行时等待空闲。请保持应用运行。
 - **关机**：至少 60 秒倒计时，可取消。默认等待已观察到的运行中及待回复会话结束。关机不强制关闭未保存的程序。
 
-Claude / DSH 可以配置额度耗尽后关机；界面隐藏尚不支持的自动恢复选项。组合条件「任务结束或中断」若遇到这两者额度耗尽并打算继续或新建任务，会保持挂起并说明缺少恢复接口，避免无效重试。
+专用额度触发条件和等待额度动作已移除。用户可自行设定预计可继续的时间。旧额度规则转为停用的定时规则，保留名称与指令，设置时间后再启用；旧额度等待动作取消，其他规则保留。
 
-表单按 Agent、条件、动作显示相关输入。次数在排队时累计，取消也计入上限。默认继续最多 3 次，新任务和关机最多 1 次，可主动重置。重试会增加等待时间；不绕过审批或沙箱；必须同时取得成功的最终事件和退出码才报告执行成功。
+已保存规则同时显示任务标题与会话 ID。点击「重新选择对话」，再点击已发现会话的「选择」，直接更新并保存该规则。保存任务后显示成功提示。表单按条件、动作显示相关输入。定时动作固定一次，不额外添加事件延迟。次数在排队时累计，取消也计入上限。默认继续最多 3 次，新任务和关机最多 1 次，可主动重置。重试会增加等待时间；不绕过审批或沙箱；必须同时取得成功的最终事件和退出码才报告执行成功。
 
-Agent 与 session ID 共同决定身份，相同 ID 不会跨 Agent 触发规则。历史回填不执行动作，用户开始新回合会取消旧待执行动作。停用、编辑或删除规则会取消其待执行动作。重启不重放可能已执行的动作；等待额度的请求可保留。
+Agent 与 session ID 共同决定身份，相同 ID 不会跨 Agent 触发规则。历史回填不执行事件动作，用户开始新回合会取消旧事件重试；定时动作保留并等待空闲。停用、编辑或删除规则会取消其待执行动作。重启保留未来的定时计划；已错过时间或可能已执行的动作取消，不补执行。
 
 ## 会话没有显示时
 
@@ -44,8 +44,8 @@ Codex 监听与历史列表使用相同路径，支持 `CODEX_HOME`、`LLMPET_CO
 
 为兼容已有规则，状态文件仍为 `~/.octopus/codex-automation.json`，旧规则自动归属 Codex。文件名保留不代表在读取旧版本配置。`LLMPET_AUTOMATION_STATE` 可指定独立状态文件。
 
-`LLMPET_NO_CODEX=1`、`LLMPET_NO_DSH=1` 只停用对应 Agent；`OCTOPUS_NO_NET=1` 禁止自动模型任务和额度查询联网，本地关机动作仍可使用。
+`LLMPET_NO_CODEX=1`、`LLMPET_NO_DSH=1` 只停用对应 Agent；`OCTOPUS_NO_NET=1` 禁止自动模型任务联网，本地关机动作仍可使用。
 
 `npm test` 包含多 Agent 状态、身份隔离、旧规则兼容、mtime 固定时的会话发现，以及 CLI 输出与退出码测试。`npm run test:automation-ui` 启动真实 Electron，以隔离数据验证三种 Agent 的发现、选择、规则保存、hook / 日志触发、取消、动态表单和诊断面板；不实际执行关机或模型任务。
 
-协议来源：[Claude Code 程序化运行](https://code.claude.com/docs/en/headless)、[DSH headless 官方说明](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/bundle/headless/README.md)。Codex 的额度和执行细节见 [Codex 说明](codex-automation.md)。
+协议来源：[Claude Code 程序化运行](https://code.claude.com/docs/en/headless)、[DSH headless 官方说明](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/bundle/headless/README.md)。Codex 的定时调度和执行细节见 [Codex 说明](codex-automation.md)。

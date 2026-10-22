@@ -38,10 +38,12 @@ function fakeChild() { const child = new EventEmitter(); child.stdin = new PassT
   assert.strictEqual(classifyError({ message: 'rate_limit_exceeded 429' }).kind, 'transient_error');
   assert.strictEqual(classifyError({ message: 'invalid API key' }).kind, 'failed');
   assert.throws(() => normalizeRule({ trigger: 'idle', action: 'shutdown' }));
-  assert.strictEqual(normalizeRule({ sessionId: SID, trigger: 'quota_exhausted', action: 'shutdown' }).delaySeconds, 60);
+  assert.throws(() => normalizeRule({ sessionId: SID, trigger: 'quota_exhausted', action: 'shutdown' }));
+  assert.throws(() => normalizeRule({ sessionId: SID, trigger: 'quota_restored', action: 'continue' }));
+  assert.throws(() => normalizeRule({ sessionId: SID, trigger: 'ended', action: 'wait_quota' }));
   assert.throws(() => normalizeRule({ sessionId: SID, trigger: 'completed', action: 'new_task' }));
   const powerRule = normalizeRule({ sessionId: SID, trigger: 'ended', action: 'shutdown', prompt: 'stale draft', cwd: root, limitId: 'stale-bucket' });
-  assert.strictEqual(powerRule.prompt, ''); assert.strictEqual(powerRule.cwd, ''); assert.strictEqual(powerRule.limitId, '');
+  assert.strictEqual(powerRule.prompt, ''); assert.strictEqual(powerRule.cwd, ''); assert.strictEqual(powerRule.limitId, undefined);
   const raw = normalizeQuota({ limit_id: 'other', primary: { used_percent: 99, resets_at: Math.floor(time / 1000) + 600 }, secondary: { used_percent: 100, resets_at: Math.floor(time / 1000) + 2000 } }, time);
   assert.strictEqual(raw.limitId, 'other'); assert(raw.secondary.resetsAt > time);
   assert(!quotaAvailable(raw, time - 1, time), 'both quota windows must recover');
@@ -76,35 +78,66 @@ function fakeChild() { const child = new EventEmitter(); child.stdin = new PassT
     assert.strictEqual(restarted.snapshot().jobs.length, 1, 'persisted event IDs prevent replay');
   }
   {
-    const f = fixture(); f.rule({ trigger: 'quota_exhausted', action: 'wait_quota' }); f.event({ kind: 'quota_exhausted' });
-    const before = time; time += 5000;
-    f.engine.observeQuota(quota({ limitId: 'wrong' })); await f.engine.tick(); assert.strictEqual(f.runs.length, 0);
-    f.engine.observeQuota(quota({ provider: 'other-provider' })); await f.engine.tick(); assert.strictEqual(f.runs.length, 0);
-    f.engine.observeQuota(quota({ secondary: { usedPercent: 100, resetsAt: time + 60000 } })); await f.engine.tick(); assert.strictEqual(f.runs.length, 0);
-    time += 1000; f.engine.observeQuota(quota()); await f.engine.tick(); await settle(); assert.strictEqual(f.runs.length, 1);
-    assert(f.engine.snapshot().jobs[0].blockedAt >= before);
+    const f = fixture();
+    f.rule({ trigger: 'scheduled', scheduledAt: time + 5000, sessionTitle: 'A task', sessionCwd: root, sessionProvider: 'custom', sessionModel: 'original-model', delaySeconds: 300 });
+    assert.strictEqual(f.engine.snapshot().jobs.length, 1, 'time rules do not need a terminal event');
+    await f.engine.tick(); assert.strictEqual(f.runs.length, 0);
+    time += 5000; await f.engine.tick(); await settle();
+    assert.strictEqual(f.runs.length, 1); assert.strictEqual(f.runs[0].cwd, root);
+    assert.strictEqual(f.runs[0].provider, 'custom'); assert.strictEqual(f.runs[0].model, 'original-model');
+    f.event({ kind: 'completed' }); time += 1000; await f.engine.tick();
+    assert.strictEqual(f.runs.length, 1, 'timer runs once without adding an event delay or retry loop');
   }
   {
-    const f = fixture(); f.rule({ trigger: 'quota_exhausted', action: 'shutdown', delaySeconds: 1 }); f.event({ kind: 'quota_exhausted' });
-    assert.strictEqual(f.engine.snapshot().jobs[0].status, 'scheduled', 'shutdown is independently selectable for quota exhaustion');
-    time += 59000; await f.engine.tick(); assert.strictEqual(f.powers.length, 0);
-    const id = f.engine.snapshot().jobs[0].id; assert(f.engine.cancelJob(id)); time += 2000; await f.engine.tick(); assert.strictEqual(f.powers.length, 0);
+    const f = fixture(); const first = f.rule({ trigger: 'scheduled', scheduledAt: time + 1000 });
+    f.rule({ trigger: 'scheduled', scheduledAt: time + 2000 });
+    assert.strictEqual(f.engine.snapshot().jobs.length, 2, 'two timers for one session stay independent');
+    const next = f.engine.saveRule({ ...first, sessionId: SID2, sessionTitle: 'Replacement', scheduledAt: time + 3000 });
+    assert.strictEqual(next.sessionTitle, 'Replacement');
+    const pending = f.engine.snapshot().jobs.filter(j => j.ruleId === first.id && j.status === 'scheduled');
+    assert.strictEqual(pending.length, 1); assert.strictEqual(pending[0].sessionId, SID2);
+    assert(f.engine.snapshot().jobs.some(j => j.ruleId === first.id && j.status === 'cancelled'));
+    time += 3000; await f.engine.tick(); await settle(); assert.strictEqual(f.runs.length, 2);
   }
   {
-    const f = fixture(); f.rule({ trigger: 'quota_restored', action: 'new_task', prompt: 'Next', limitId: 'model-bucket' });
-    f.rule({ trigger: 'quota_restored', action: 'new_task', prompt: 'Wrong', limitId: 'another-bucket' });
-    f.event({ kind: 'quota_exhausted' }); time += 1000;
-    f.engine.observeQuota(quota({ limitId: 'model-bucket' })); await f.engine.tick(); await settle();
-    assert.strictEqual(f.runs.length, 1, 'quota-restored rules respect each configured bucket');
-    assert.strictEqual(f.runs[0].prompt, 'Next');
+    const f = fixture(); f.rule({ trigger: 'scheduled', scheduledAt: time + 1000 });
+    f.event({ kind: 'running' }); assert.strictEqual(f.engine.snapshot().jobs[0].status, 'scheduled');
+    time += 1000; await f.engine.tick(); assert.strictEqual(f.runs.length, 0);
+    assert.strictEqual(f.engine.snapshot().jobs[0].status, 'waiting_idle');
+    f.event({ kind: 'completed' }); await f.engine.tick(); await settle(); assert.strictEqual(f.runs.length, 1);
   }
   {
-    const f = fixture(); f.rule({ trigger: 'quota_exhausted', action: 'wait_quota', delaySeconds: 300 });
-    f.event({ kind: 'quota_exhausted' }); time += 1000; f.engine.observeQuota(quota()); await f.engine.tick();
-    time += 301000; await f.engine.tick(); assert.strictEqual(f.runs.length, 0, 'recheck quota after a long delay');
-    assert.strictEqual(f.engine.snapshot().jobs[0].status, 'waiting_quota');
-    time += 1000; f.engine.observeQuota(quota()); await f.engine.tick(); await settle();
-    assert.strictEqual(f.runs.length, 1, 'refreshing stale quota must not restart the full delay');
+    const f = fixture(); f.rule({ trigger: 'scheduled', scheduledAt: time + 8 * 86400000 });
+    const restarted = createCodexAutomation(f.options);
+    assert.strictEqual(restarted.snapshot().jobs[0].status, 'scheduled', 'future timers survive restart');
+    time += 8 * 86400000; await restarted.tick(); await settle();
+    assert.strictEqual(f.runs.length, 1, 'long-term schedules expire relative to due time');
+    await restarted.tick(); assert.strictEqual(f.runs.length, 1);
+    const g = fixture(); g.rule({ trigger: 'scheduled', scheduledAt: time + 1000 });
+    time += 2000;
+    const overdue = createCodexAutomation(g.options); await overdue.tick();
+    assert.strictEqual(overdue.snapshot().jobs[0].status, 'cancelled', 'missed timers are not replayed on startup');
+    assert.strictEqual(g.runs.length, 0);
+  }
+  {
+    const f = fixture();
+    assert.throws(() => f.rule({ trigger: 'scheduled', scheduledAt: time - 1 }), /future/);
+    assert.throws(() => f.rule({ trigger: 'scheduled', scheduledAt: time + 1000, action: 'shutdown' }), /60/);
+    assert.throws(() => f.rule({ trigger: 'scheduled' }), /execution time/);
+    const r = f.rule({ trigger: 'scheduled', scheduledAt: time + 1000 });
+    f.engine.saveRule({ ...r, enabled: false }); time += 2000; await f.engine.tick();
+    assert.strictEqual(f.runs.length, 0, 'disabling cancels a timer');
+  }
+  {
+    const statePath = path.join(root, 'quota-migration.json');
+    const old = { id: 'old-quota', sessionId: SID, trigger: 'quota_exhausted', action: 'wait_quota', enabled: true, prompt: 'Continue draft' };
+    fs.writeFileSync(statePath, JSON.stringify({ version: 1, rules: [old, { ...old, id: 'normal', trigger: 'ended', action: 'shutdown' }],
+      jobs: [{ ruleId: old.id, action: 'wait_quota', trigger: 'quota_exhausted', status: 'waiting_quota' }], history: [], seen: [], counts: {}, quotas: {} }));
+    const e = createCodexAutomation({ statePath }); const snap = e.snapshot();
+    assert(!snap.error); assert.strictEqual(snap.rules.length, 2);
+    assert.deepStrictEqual([snap.rules[0].trigger, snap.rules[0].action, snap.rules[0].enabled, snap.rules[0].needsSchedule], ['scheduled', 'continue', false, true]);
+    assert.strictEqual(snap.rules[0].prompt, 'Continue draft'); assert.strictEqual(snap.jobs[0].status, 'cancelled');
+    assert.strictEqual(snap.rules[1].enabled, true, 'normal rules survive quota migration');
   }
   {
     const statePath = path.join(root, 'broken.json'); fs.writeFileSync(statePath, '{broken');
@@ -149,7 +182,7 @@ function fakeChild() { const child = new EventEmitter(); child.stdin = new PassT
     const fp = path.join(dir, `rollout-test-${SID}.jsonl`);
     const line = payload => JSON.stringify({ type: 'event_msg', timestamp: new Date(time).toISOString(), payload }) + '\n';
     fs.writeFileSync(fp, JSON.stringify({ type: 'session_meta', payload: { id: SID, cwd: root, model_provider: 'openai' } }) + '\n' + line({ type: 'task_complete', turn_id: 'historical' }));
-    const watcher = createCodexWatch({ sessionsDir: path.join(root, 'sessions'), core: { seedSession() {}, updateSession() {}, setContextUsage() {} }, onStatus: e => f.engine.observe(e), onQuota: (q, o) => f.engine.observeQuota(q, o) });
+    const watcher = createCodexWatch({ sessionsDir: path.join(root, 'sessions'), core: { seedSession() {}, updateSession() {}, setContextUsage() {} }, onStatus: e => f.engine.observe(e) });
     watcher.tick(); assert.strictEqual(f.engine.snapshot().jobs.length, 0);
     fs.appendFileSync(fp, line({ type: 'task_started', turn_id: 'live' }) + line({ type: 'stream_error', message: 'network connection lost', will_retry: true }));
     watcher.tick(); assert.strictEqual(f.engine.snapshot().sessions[0].kind, 'error_observed'); assert.strictEqual(f.engine.snapshot().jobs.length, 0);
@@ -182,5 +215,5 @@ function fakeChild() { const child = new EventEmitter(); child.stdin = new PassT
     const calls = []; await powerOff('win32', (file, args, opts, callback) => { calls.push({ file, args }); callback(null); });
     assert.deepStrictEqual(calls[0], { file: 'shutdown.exe', args: ['/s', '/t', '0'] });
   }
-  console.log('Codex automation: triggers, quota recovery, independent actions, bounded retries, restart safety, watcher and executor checks passed');
+  console.log('Codex automation: time triggers, quota migration, independent actions, bounded retries, restart safety, watcher and executor checks passed');
 })().catch(err => { console.error(err); process.exitCode = 1; });

@@ -30,7 +30,7 @@ function fakeChild() { const c = new EventEmitter(); c.stdin = new PassThrough()
   engine.observe(event('claude', { kind: 'running', turnId: 'turn-2' }));
   assert.strictEqual(engine.snapshot().jobs.find(j => j.agent === 'claude').status, 'cancelled');
   assert.strictEqual(engine.snapshot().jobs.find(j => j.agent === 'codex').status, 'scheduled');
-  assert.throws(() => engine.saveRule(rule('dsh', { action: 'wait_quota', trigger: 'quota_exhausted' })), /Quota recovery/);
+  assert.throws(() => engine.saveRule(rule('dsh', { action: 'wait_quota', trigger: 'quota_exhausted' })), /Invalid trigger or action/);
   const legacyPath = path.join(root, 'legacy.json');
   fs.writeFileSync(legacyPath, JSON.stringify({ version: 1, rules: [{ ...rule('codex'), agent: undefined }], jobs: [], history: [], seen: [], counts: {}, quotas: {} }));
   assert.strictEqual(createAgentAutomation({ statePath: legacyPath }).snapshot().rules[0].agent, 'codex', 'old rules migrate without deleting user settings');
