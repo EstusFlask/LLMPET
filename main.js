@@ -46,6 +46,7 @@ const { launchClaude, launchCodex, launchDsh, ensureDshWeb, launchExecutable, fi
 const { createAgentStartup } = require('./backend/agent-startup');
 const { createCodexWatch } = require('./backend/codex-watch');
 const { createAgentAutomation } = require('./backend/codex-automation');
+const { readAccountQuotas } = require('./backend/codex-control');
 const { createAgentExecutor } = require('./backend/agent-control');
 const { createClaudeActivityAdapter } = require('./backend/agent-events');
 const { createDshWatch } = require('./backend/dsh-watch');
@@ -1128,6 +1129,9 @@ function bootBackend() {
     run: (job, onThread) => process.env.OCTOPUS_NO_NET === '1'
       ? Promise.resolve({ ok: false, kind: 'failed', message: '离线模式禁止自动任务联网 / Offline mode blocks automated inference' })
       : codexExecutor.run(job, onThread),
+    readQuotas: () => process.env.OCTOPUS_NO_NET === '1'
+      ? Promise.resolve({ ok: false, message: '离线模式不查询账号额度 / Offline mode disables quota queries' })
+      : readAccountQuotas(),
     flushStatus: () => { if (codexWatch) codexWatch.tick(); if (dshWatch) dshWatch.tick(); },
     isBusy: () => [...core.sessions.values()].some(s =>
       ['working', 'thinking', 'juggling', 'sweeping', 'carrying', 'notification'].includes(s.state)),
@@ -1327,6 +1331,16 @@ function registerIpc() {
   ipcMain.handle('automation-remove', (e, id) => automationCall(e, () => codexAutomation.removeRule(id)));
   ipcMain.handle('automation-reset', (e, id) => automationCall(e, () => codexAutomation.resetCount(id)));
   ipcMain.handle('automation-cancel', (e, id) => automationCall(e, () => codexAutomation.cancelJob(id)));
+  ipcMain.handle('automation-refresh-quota', e => automationCall(e, () => { codexAutomation.refreshQuotas(); return true; }));
+  ipcMain.handle('automation-open-session', async (e, id) => {
+    const result = automationCall(e, () => codexAutomation.snapshot().jobs.find(j => j.id === id && j.agent === 'codex'));
+    if (!result.ok || !result.value) return { ok: false, message: '会话不存在 / Session not found' };
+    try {
+      await shell.openExternal(`codex://threads/${encodeURIComponent(result.value.sessionId)}`);
+      clipboard.writeText(result.value.prompt || '继续');
+      return { ok: true };
+    } catch (err) { return { ok: false, message: err.message }; }
+  });
   ipcMain.handle('get-stats', (e) => {
     // Do not return a stale cached price/token snapshot to a newly opened
     // dashboard. buildStats is read-only and reflects the latest ledger scan.

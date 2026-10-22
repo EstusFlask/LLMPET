@@ -32,6 +32,88 @@ function quota(patch = {}) { return { limitId: 'codex', provider: 'openai', at: 
 function fakeChild() { const child = new EventEmitter(); child.stdin = new PassThrough(); child.stdout = new PassThrough(); child.kill = () => {}; return child; }
 
 (async () => {
+  {
+    const f = fixture(); const r = f.rule({ trigger: 'scheduled', scheduledAt: time + 1000 });
+    assert.strictEqual(f.engine.snapshot().counts[r.id] || 0, 0, 'queued actions must not count as successful runs');
+    f.engine.resetCount(r.id);
+    assert.strictEqual(f.engine.snapshot().counts[r.id], 0, 'pending actions allow resetting the count');
+    assert.strictEqual(f.engine.snapshot().jobs.filter(j => j.status === 'scheduled').length, 1, 'reset preserves the single pending action');
+    f.engine.cancelJob(f.engine.snapshot().jobs[0].id); await f.engine.tick();
+    assert.strictEqual(f.engine.snapshot().jobs.length, 1, 'cancelling must not recreate the same future plan');
+    assert.strictEqual(f.engine.snapshot().jobs[0].status, 'cancelled');
+  }
+  {
+    const child = fakeChild(); child.stderr = new PassThrough();
+    const e = createCodexExecutor({ findCli: () => 'codex.exe', spawn: () => child });
+    const result = e.run({ action: 'continue', sessionId: SID, cwd: root, prompt: 'test' });
+    child.stderr.write(`Error: thread ${SID} already has an active writer\n`); child.emit('close', 1);
+    const value = await result;
+    assert.strictEqual(value.kind, 'session_busy', 'stderr writer conflicts must become a visible waiting reason');
+    assert(value.message.includes('active writer'), 'retain the actual CLI diagnostic');
+  }
+  {
+    const child = fakeChild(); child.stderr = new PassThrough();
+    const e = createCodexExecutor({ findCli: () => 'codex.exe', spawn: () => child });
+    const result = e.run({ action: 'continue', sessionId: SID, cwd: root, prompt: 'test' });
+    child.stderr.write('Error: authentication failed\nAuthorization: Bearer secret-header\nAPI key=secret-key\n'); child.emit('close', 1);
+    const value = await result;
+    assert(value.message.includes('authentication failed'));
+    assert(!value.message.includes('secret-header') && !value.message.includes('secret-key'), 'diagnostics redact secrets before persistence');
+  }
+  {
+    let busy = true;
+    const f = fixture({ run: async job => busy ? { ok: false, kind: 'session_busy', message: 'active writer' } : { ok: true, kind: 'completed', sessionId: job.sessionId } });
+    const r = f.rule({ trigger: 'scheduled', scheduledAt: time + 1000 });
+    time += 1000; await f.engine.tick(); await settle();
+    assert.strictEqual(f.engine.snapshot().jobs[0].status, 'waiting_session');
+    assert.strictEqual(f.engine.snapshot().counts[r.id] || 0, 0);
+    assert.strictEqual(f.engine.snapshot().attempts[r.id], 0, 'writer conflicts consume no attempts');
+    f.engine.resetCount(r.id); busy = false;
+    time += 30000; await f.engine.tick(); await settle();
+    assert.strictEqual(f.engine.snapshot().counts[r.id], 1, 'count only after a successful completion');
+    f.engine.resetCount(r.id); await f.engine.tick();
+    assert.strictEqual(f.engine.snapshot().counts[r.id], 0, 'reset must remain zero without replaying an expired timer');
+    assert.strictEqual(createCodexAutomation(f.options).snapshot().counts[r.id], 0);
+  }
+  {
+    const f = fixture({ run: async () => ({ ok: false, kind: 'failed', message: 'failure' }) });
+    const r = f.rule({ maxRuns: 1 }); f.event(); await f.engine.tick(); await settle();
+    assert.strictEqual(f.engine.snapshot().counts[r.id] || 0, 0, 'failure does not count as success');
+    assert.strictEqual(f.engine.snapshot().attempts[r.id], 1);
+    assert.strictEqual(f.engine.snapshot().jobs.length, 1, 'failures remain bounded without inflating successful counts');
+    f.engine.resetCount(r.id); f.event(); await f.engine.tick(); await settle();
+    assert.strictEqual(f.engine.snapshot().jobs.length, 2, 'reset allows a new attempt');
+  }
+  {
+    const f = fixture({ run: async () => ({ ok: false, kind: 'session_busy', message: 'active writer' }) });
+    f.rule({ trigger: 'scheduled', scheduledAt: time + 1000 }); time += 1000; await f.engine.tick(); await settle();
+    f.event({ kind: 'running' });
+    assert.strictEqual(f.engine.snapshot().jobs[0].status, 'cancelled', 'manual continuation supersedes the queued writer retry');
+  }
+  {
+    const f = fixture(); const r = f.rule({ trigger: 'quota_5h_restored', sessionCwd: root, sessionProvider: 'custom', maxRuns: 1 });
+    f.rule({ trigger: 'quota_weekly_restored', sessionCwd: root, maxRuns: 1 });
+    const account = patch => quota({ source: 'account', primary: { usedPercent: 100, windowMinutes: 300, resetsAt: time + 60000 }, secondary: { usedPercent: 100, windowMinutes: 10080, resetsAt: time + 86400000 }, ...patch });
+    f.engine.observeQuota(account(), { seed: true });
+    assert.strictEqual(f.engine.snapshot().jobs.length, 0, 'initial quota snapshot establishes a baseline');
+    time += 1000; f.engine.observeQuota(account({ primary: { usedPercent: 0, windowMinutes: 300, resetsAt: time + 300000 } }));
+    assert.strictEqual(f.engine.snapshot().jobs.length, 1);
+    assert.strictEqual(f.engine.snapshot().jobs[0].trigger, 'quota_5h_restored');
+    assert.strictEqual(f.engine.snapshot().jobs[0].provider, 'custom', 'account trigger does not change inference provider');
+    await f.engine.tick(); await settle(); assert.strictEqual(f.engine.snapshot().counts[r.id], 1);
+    time += 1000; f.engine.observeQuota(account({ primary: { usedPercent: 5, windowMinutes: 300, resetsAt: time + 300000 }, secondary: { usedPercent: 10, windowMinutes: 10080, resetsAt: time + 86400000 } }));
+    assert.strictEqual(f.engine.snapshot().jobs[0].trigger, 'quota_weekly_restored');
+    assert.strictEqual(f.engine.snapshot().jobs.length, 2, 'weekly recovery is independent of the 5-hour event');
+    time += 1000; f.engine.observeQuota(account({ source: 'rollout' }));
+    assert.strictEqual(f.engine.snapshot().jobs.length, 2, 'rollout caches cannot establish account recovery');
+  }
+  {
+    const f = fixture(); f.rule({ trigger: 'quota_5h_restored' });
+    const q = quota({ source: 'account', primary: { usedPercent: 40, windowMinutes: 300, resetsAt: time + 1000 } });
+    f.engine.observeQuota(q, { seed: true }); time += 2000;
+    f.engine.observeQuota({ ...q, at: time, primary: { usedPercent: 0, windowMinutes: 300, resetsAt: time + 18000000 } });
+    assert.strictEqual(f.engine.snapshot().jobs.length, 1, 'an observed reset triggers even if the old window was not completely used');
+  }
   assert.strictEqual(classifyError({ codexErrorInfo: 'UsageLimitExceeded' }).kind, 'quota_exhausted');
   assert.strictEqual(classifyError({ message: "You've hit your usage limit" }).kind, 'quota_exhausted');
   assert.strictEqual(classifyError({ codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 401 } } }).kind, 'failed');
@@ -43,7 +125,7 @@ function fakeChild() { const child = new EventEmitter(); child.stdin = new PassT
   assert.throws(() => normalizeRule({ sessionId: SID, trigger: 'ended', action: 'wait_quota' }));
   assert.throws(() => normalizeRule({ sessionId: SID, trigger: 'completed', action: 'new_task' }));
   const powerRule = normalizeRule({ sessionId: SID, trigger: 'ended', action: 'shutdown', prompt: 'stale draft', cwd: root, limitId: 'stale-bucket' });
-  assert.strictEqual(powerRule.prompt, ''); assert.strictEqual(powerRule.cwd, ''); assert.strictEqual(powerRule.limitId, undefined);
+  assert.strictEqual(powerRule.prompt, ''); assert.strictEqual(powerRule.cwd, ''); assert.strictEqual(powerRule.limitId, '');
   const raw = normalizeQuota({ limit_id: 'other', primary: { used_percent: 99, resets_at: Math.floor(time / 1000) + 600 }, secondary: { used_percent: 100, resets_at: Math.floor(time / 1000) + 2000 } }, time);
   assert.strictEqual(raw.limitId, 'other'); assert(raw.secondary.resetsAt > time);
   assert(!quotaAvailable(raw, time - 1, time), 'both quota windows must recover');

@@ -38,6 +38,10 @@ if (!process.versions.electron) {
   const stateDir = path.join(testDir, '.octopus');
   fs.mkdirSync(stateDir, { recursive: true });
   fs.writeFileSync(path.join(stateDir, 'config.json'), JSON.stringify({ agentStartup: { claude: false, codex: false, dsh: false } }));
+  fs.writeFileSync(path.join(stateDir, 'codex-automation.json'), JSON.stringify({ version: 1, countersVersion: 2, rules: [], jobs: [], history: [], seen: [], counts: {}, attempts: {}, quotas: {
+    'openai:codex': { provider: 'openai', source: 'account', limitId: 'codex', at: Date.now(),
+      primary: { windowMinutes: 300, usedPercent: 48, resetsAt: Date.now() + 3600000 }, secondary: { windowMinutes: 10080, usedPercent: 88, resetsAt: Date.now() + 86400000 } },
+  } }));
   const sid = '019f5103-921c-7ac1-9a8d-c4f8ff8a67aa', d = new Date();
   const sessions = path.join(testDir, '.codex', 'sessions', String(d.getFullYear()), String(d.getMonth() + 1).padStart(2, '0'), String(d.getDate()).padStart(2, '0'));
   fs.mkdirSync(sessions, { recursive: true });
@@ -65,6 +69,12 @@ if (!process.versions.electron) {
   const dshLog = path.join(dshDir, 'session.jsonl');
   fs.writeFileSync(dshLog, JSON.stringify({ type: 'session', version: 0, id: 'ses_fixture', cwd: root, delegationDepth: 0 }) + '\n');
   const errors = [];
+  const openedSessions = [], copiedPrompts = [];
+  require('electron').shell.openExternal = async url => { openedSessions.push(url); };
+  require('electron').clipboard.writeText = value => { copiedPrompts.push(value); };
+  const automationModule = require('../backend/codex-automation'), createAutomation = automationModule.createAgentAutomation;
+  automationModule.createAgentAutomation = deps => createAutomation({ ...deps, run: (job, cb) => job.prompt === 'UI_BUSY_WRITER'
+    ? Promise.resolve({ ok: false, kind: 'session_busy', message: 'Fixture active writer' }) : deps.run(job, cb) });
   app.on('web-contents-created', (_event, wc) => wc.on('console-message', (_e, level, message) => {
     if (level === 3 && !message.includes('Content Security Policy')) errors.push(message);
   }));
@@ -109,7 +119,9 @@ if (!process.versions.electron) {
       for (const agent of ['codex','claude','dsh']) {
         set('agent', agent);
         if (document.querySelector('#auto-trigger [value="quota_exhausted"], #auto-trigger [value="quota_restored"], #auto-action [value="wait_quota"]')) throw Error('Removed quota choices are still offered');
+        if ([...document.querySelectorAll('#auto-trigger [value^="quota_"]')].some(o=>o.disabled !== (agent!=='codex'))) throw Error('Account quota triggers require Codex');
       }
+      if (!document.getElementById('auto-quotas').textContent.includes('48%') || !document.getElementById('auto-quotas').textContent.includes('88%')) throw Error('Both account quota windows must be visible');
       set('agent', 'codex'); set('trigger', 'completed');
       if (document.getElementById('auto-action').value || visible('prompt-field') || visible('cwd-field') || visible('idle-field') || visible('limits') || visible('time-field')) throw Error('Action-specific fields visible before selection');
       set('action', 'new_task');
@@ -124,6 +136,7 @@ if (!process.versions.electron) {
       await pause(250); const a = await window.pet.getAutomation();
       if (!a.ok || a.value.rules.length !== 1) throw Error('Rule IPC save failed');
       const r = a.value.rules[0];
+      if ((a.value.counts[r.id] || 0) !== 0) throw Error('Saving a rule must show 0 successful runs');
       if (r.enabled || r.delaySeconds < 60 || r.maxRuns !== 1 || r.trigger !== 'ended') throw Error('Unsafe shutdown defaults or combined trigger missing');
       if (r.prompt || r.cwd || r.limitId) throw Error('Hidden field drafts leaked into the saved shutdown rule');
       if (r.sessionTitle !== 'UI 测试原会话' || !document.getElementById('auto-rules').textContent.includes('UI 测试原会话')) throw Error('Saved rule must show its task title');
@@ -149,6 +162,11 @@ if (!process.versions.electron) {
       await pause(250); const b = await window.pet.getAutomation();
       const timerRule = b.value.rules.find(x=>x.trigger==='scheduled');
       if (b.value.rules.length !== 2 || b.value.jobs.length || timerRule.scheduledAt!==at || timerRule.maxRuns!==1 || timerRule.sessionCwd!==${JSON.stringify(root)}) throw Error('Local execution time or source session did not round trip');
+      const pending = await window.pet.saveAutomationRule({ ...timerRule, enabled: true });
+      document.querySelector('[data-auto="reset"][data-id="'+timerRule.id+'"]').click(); await pause(200);
+      const afterReset = (await window.pet.getAutomation()).value;
+      if (!pending.ok || afterReset.counts[timerRule.id] !== 0 || afterReset.jobs.filter(j=>j.ruleId===timerRule.id&&j.status==='scheduled').length!==1) throw Error('Reset must work with a queued timer and preserve 0/1');
+      await window.pet.cancelAutomationJob(afterReset.jobs.find(j=>j.ruleId===timerRule.id).id);
       await window.pet.saveAutomationRule({ ...r, enabled: true });
       return { actions: b.value.rules.map(x => x.action), ruleId: r.id };
     })()`);
@@ -156,18 +174,19 @@ if (!process.versions.electron) {
     fs.appendFileSync(rollout, event({ type: 'task_started', turn_id: 'live-completion' })
       + event({ type: 'task_complete', turn_id: 'live-completion' }));
     fs.utimesSync(rollout, frozenTime, frozenTime);
-    await until(() => win.webContents.executeJavaScript('(async()=>{const r=await window.pet.getAutomation();return r.value.jobs.length===1})()'));
+    await until(() => win.webContents.executeJavaScript('(async()=>{const r=await window.pet.getAutomation();return r.value.jobs.filter(j=>j.action==="shutdown").length===1})()'));
     const cancelled = await win.webContents.executeJavaScript(`(async()=>{
       const r=await window.pet.getAutomation(); const job=r.value.jobs[0];
       if(job.action!=='shutdown'||job.dueAt-Date.now()<50000)throw Error('Countdown missing');
-      const cancel=document.querySelector('[data-auto="cancel"]');if(!cancel)throw Error('Cancel UI missing');cancel.click();
+      await new Promise(r=>setTimeout(r,100));
+      const cancel=document.querySelector('[data-auto="cancel"][data-id="'+job.id+'"]');if(!cancel)throw Error('Cancel UI missing');cancel.click();
       await new Promise(r=>setTimeout(r,200));const next=await window.pet.getAutomation();return next.value.jobs[0].status;
     })()`);
     assert.strictEqual(cancelled, 'cancelled');
     await win.webContents.executeJavaScript(`window.pet.resetAutomationCount(${JSON.stringify(result.ruleId)})`);
     fs.appendFileSync(rollout, event({ type: 'task_started', turn_id: 'live-interruption' })
       + event({ type: 'turn_aborted', turn_id: 'live-interruption', reason: 'interrupted' }));
-    await until(() => win.webContents.executeJavaScript('(async()=>{const r=await window.pet.getAutomation();return r.value.jobs.length===2})()'));
+    await until(() => win.webContents.executeJavaScript('(async()=>{const r=await window.pet.getAutomation();return r.value.jobs.filter(j=>j.action==="shutdown").length===2})()'));
     await win.webContents.executeJavaScript('(async()=>{const r=await window.pet.getAutomation();if(r.value.jobs[0].trigger!=="interrupted")throw Error("Combined trigger missed interruption");await window.pet.cancelAutomationJob(r.value.jobs[0].id)})()');
     await win.webContents.executeJavaScript(`(async()=>{
       const set=(id,value)=>{const e=document.getElementById('auto-'+id);e.value=value;e.dispatchEvent(new Event('change'))};
@@ -189,6 +208,26 @@ if (!process.versions.electron) {
       + JSON.stringify({ type: 'turn/end', seq: 2, time: Date.now(), data: { turn: 1, reason: { kind: 'completed' } } }) + '\n');
     await until(() => win.webContents.executeJavaScript('(async()=>{const r=await window.pet.getAutomation();return ["claude","dsh"].every(a=>r.value.jobs.some(j=>j.agent===a))})()'));
     await win.webContents.executeJavaScript('(async()=>{const r=await window.pet.getAutomation();for(const j of r.value.jobs)if(j.status==="scheduled")await window.pet.cancelAutomationJob(j.id);await window.pet.rescanAutomationSessions()})()');
+    await win.webContents.executeJavaScript(`(async()=>{
+      const set=(id,value)=>{const e=document.getElementById('auto-'+id);e.value=value;e.dispatchEvent(new Event('change'))};
+      for(const trigger of ['quota_5h_restored','quota_weekly_restored']) {
+        document.getElementById('auto-clear').click();set('agent','codex');set('session',${JSON.stringify(sid)});set('trigger',trigger);set('action','continue');
+        if(document.getElementById('auto-quota-note').hidden||!document.getElementById('auto-time-field').hidden)throw Error('Quota form must identify account scope');
+        document.getElementById('auto-form').dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));await new Promise(r=>setTimeout(r,150));
+      }
+      const s=(await window.pet.getAutomation()).value;
+      if(!['quota_5h_restored','quota_weekly_restored'].every(t=>s.rules.some(r=>r.trigger===t&&!r.enabled&&r.limitId==='codex')))throw Error('Separate quota rules did not save');
+      const result=await window.pet.saveAutomationRule({sessionId:${JSON.stringify(sid)},agent:'codex',trigger:'scheduled',scheduledAt:Date.now()+1500,action:'continue',prompt:'UI_BUSY_WRITER',enabled:true});
+      if(!result.ok)throw Error('Busy writer fixture failed to queue');
+    })()`);
+    await until(() => win.webContents.executeJavaScript('(async()=>{const s=(await window.pet.getAutomation()).value;return s.jobs.some(j=>j.status==="waiting_session")})()'));
+    await win.webContents.executeJavaScript(`(async()=>{
+      const s=(await window.pet.getAutomation()).value,j=s.jobs.find(j=>j.status==='waiting_session');
+      if((s.counts[j.ruleId]||0)!==0||(s.attempts[j.ruleId]||0)!==0)throw Error('Writer lock must not consume counts');
+      const b=document.querySelector('[data-auto="open-session"][data-id="'+j.id+'"]');if(!b)throw Error('Open original session action missing');b.click();
+      await new Promise(r=>setTimeout(r,150));await window.pet.cancelAutomationJob(j.id);
+    })()`);
+    assert(openedSessions.includes(`codex://threads/${sid}`)); assert(copiedPrompts.includes('UI_BUSY_WRITER'));
     for (const [lang, title] of [['en', 'Task automation'], ['ja', 'タスク自動化'], ['zh', '任务自动化']]) {
       win.webContents.send('archive:config', { lang });
       await until(() => win.webContents.executeJavaScript(`document.getElementById('page-title').textContent===${JSON.stringify(title)}`));
@@ -201,7 +240,7 @@ if (!process.versions.electron) {
     win.setSize(920, 700); await pause(150);
     assert(!(await win.webContents.executeJavaScript('document.documentElement.scrollWidth>innerWidth')), 'Narrow workbench must not overflow');
     assert.deepStrictEqual(errors, [], 'Renderer must launch without errors');
-    console.log('LLMPET automation launch passed: Codex/Claude/DSH discovery, rule titles, one-click reselection, success feedback, local schedules, frozen-mtime recovery, hook/log triggers, cancellation, conditional fields, diagnostics, zh/en/ja');
+    console.log('LLMPET automation launch passed: discovery, five-row expansion, stable selection, rule titles, schedules, pending reset at 0/1, two account quota windows/triggers, writer waiting and open-session IPC, cancellation, diagnostics, zh/en/ja');
     console.log(`Screenshot: ${path.join(testDir, 'automation.png')}`);
     app.quit();
   })().catch(err => { fs.writeFileSync(path.join(testDir, 'failure.txt'), err.stack); console.error(err.stack); setTimeout(() => app.exit(1), 100); });

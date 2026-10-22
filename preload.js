@@ -30,6 +30,8 @@ contextBridge.exposeInMainWorld('pet', {
   removeAutomationRule: (id) => ipcRenderer.invoke('automation-remove', id),
   resetAutomationCount: (id) => ipcRenderer.invoke('automation-reset', id),
   cancelAutomationJob: (id) => ipcRenderer.invoke('automation-cancel', id),
+  refreshAutomationQuota: () => ipcRenderer.invoke('automation-refresh-quota'),
+  openAutomationSession: (id) => ipcRenderer.invoke('automation-open-session', id),
   getStats: () => ipcRenderer.invoke('get-stats'),
   openPanel: () => ipcRenderer.send('open-panel'),
   closePanel: () => ipcRenderer.send('close-panel'),
