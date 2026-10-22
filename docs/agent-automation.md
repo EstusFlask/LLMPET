@@ -2,6 +2,8 @@
 
 入口：工作台 → **任务自动化**。先选择来源 Agent，再从「已发现会话」选择会话，配置触发条件与动作并启用。规则默认关闭。
 
+右侧先显示「已保存规则」，再显示「已发现会话」。会话列表默认显示五条，点击「展开全部」查看其余会话，也可再次收起；搜索按当前 Agent 的全部已发现会话匹配。配置规则的会话 ID 输入框在选择期间不会因后台刷新重建下拉选项，选择结果和输入焦点保持稳定。
+
 | 能力 | Codex | Claude Code | DeepSeek Harness (DSH) |
 |---|---|---|---|
 | 正常结束、中断、结束或中断 | rollout 回合事件 | 原生 hook，保留 Stop 完成门 | 原生 turn/start、turn/end 日志 |
@@ -41,6 +43,8 @@ Agent 与 session ID 共同决定身份，相同 ID 不会跨 Agent 触发规则
 Codex 监听与历史列表使用相同路径，支持 `CODEX_HOME`、`LLMPET_CODEX_DIR`；Claude 会话支持 `CLAUDE_CONFIG_DIR`；DSH 支持 `DSH_HOME`、`LLMPET_DSH_DIR`。不存在的目录与被关闭的监听会明确显示。不会为解决可见性问题删除配置、归档或日志。
 
 ## 兼容与验证
+
+Windows 桌面启动未必继承终端里的 CLI 路径。自动化执行器会先检查 PATH，再检查用户安装目录、npm 启动脚本和 Codex Desktop 的版本目录；跳过已删除的版本及不能直接在 Windows 执行的无扩展名 shell 脚本。Codex 更新后会重新查找有效路径。若确实没有安装，执行记录会显示安装检查与重新安排时间的提示。
 
 为兼容已有规则，状态文件仍为 `~/.octopus/codex-automation.json`，旧规则自动归属 Codex。文件名保留不代表在读取旧版本配置。`LLMPET_AUTOMATION_STATE` 可指定独立状态文件。
 

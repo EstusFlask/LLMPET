@@ -57,8 +57,11 @@
     ja: { at: '実行日時（ローカル時間）', atNote: '指定日時に一度実行します。実行中のセッションは終了を待ちます。アプリを起動したままにしてください。', saved: '保存しました', reselect: '会話を選び直す', choosing: '検出したセッションの「選択」を押すと、このルールの会話を変更して保存します。', selected: '会話を変更して保存しました', taskTitle: 'タスク名', untitled: '無題のタスク', needsSchedule: '以前の利用枠ルールは無効です。実行日時を設定して有効にしてください。', search: 'タイトル・セッション ID で検索', scheduled: '日時を指定' },
   };
   for (const [lang, extra] of Object.entries(additions)) { Object.assign(words[lang], extra); words[lang].triggers = { scheduled: extra.scheduled, ...words[lang].triggers }; }
+  Object.assign(words.zh, { showAll: '展开全部', collapse: '收起' });
+  Object.assign(words.en, { showAll: 'Show all', collapse: 'Show fewer' });
+  Object.assign(words.ja, { showAll: 'すべて表示', collapse: '折りたたむ' });
   const agentName = agent => ({ codex: 'Codex', claude: 'Claude Code', dsh: 'DSH' })[agent || 'codex'] || agent;
-  let locale = 'zh', state = { rules: [], jobs: [], history: [], sessions: [], counts: {} }, editing = '', lastAction = '', reselecting = '';
+  let locale = 'zh', state = { rules: [], jobs: [], history: [], sessions: [], counts: {} }, editing = '', lastAction = '', reselecting = '', showAllSessions = false;
   let noticeTimer;
   const c = () => words[locale] || words.zh;
   const esc = value => String(value == null ? '' : value).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
@@ -70,6 +73,20 @@
     clearTimeout(noticeTimer); el('notice').textContent = message;
     el('notice').className = success ? 'automation-notice' : 'automation-selection';
     if (success) noticeTimer = setTimeout(() => { if (el('notice')) el('notice').textContent = ''; }, 6000);
+  }
+  const renderedHTML = new WeakMap();
+  function setHTML(id, html) {
+    const node = el(id);
+    if (renderedHTML.get(node) !== html) { node.innerHTML = html; renderedHTML.set(node, html); }
+  }
+  function renderSessionOptions(candidates) {
+    // Native datalist popups are tied to their option nodes. Replacing them
+    // during input/timer/IPC updates dismisses the chooser on Windows.
+    if (document.activeElement === el('session')) return;
+    setHTML('sessions', candidates.map(s => `<option value="${esc(s.sessionId)}">${esc(s.title || s.cwd || s.sessionId)} · ${esc(c().states[s.kind] || s.kind)}</option>`).join(''));
+  }
+  function sessionCandidates() {
+    return (state.choices || state.sessions).filter(s => (s.agent || 'codex') === el('agent').value).sort((a, b) => Number(['running', 'waiting_input'].includes(b.kind)) - Number(['running', 'waiting_input'].includes(a.kind)) || (b.at || 0) - (a.at || 0));
   }
   function shell() {
     const w = c();
@@ -87,14 +104,16 @@
       <label id="auto-idle-field" class="automation-check" hidden><input id="auto-idle" type="checkbox" checked>${esc(w.idle)}</label>
       <label class="automation-check"><input id="auto-enabled" type="checkbox">${esc(w.enabled)}</label>
       <div class="automation-actions"><button id="auto-save" class="soft-button" type="submit">${esc(w.save)}</button><button class="text-button" id="auto-clear" type="button">${esc(w.clear)}</button></div><small id="auto-limit-note" hidden>${esc(w.limitNote)}</small><small id="auto-shutdown-note" hidden>${esc(w.shutdownNote)}</small></form></article>
-      <div class="automation-stack"><article class="panel-card"><div class="section-head"><h2>${esc(w.discovered)}</h2><button id="auto-rescan" class="soft-button">${esc(w.rescan)}</button></div><input id="auto-search" class="automation-search" type="search" placeholder="${esc(w.search)}" aria-label="${esc(w.search)}"><div id="auto-live"></div></article><article class="panel-card"><h2>${esc(w.rules)}</h2><div id="auto-rules"></div></article><article class="panel-card"><h2>${esc(w.jobs)}</h2><div id="auto-jobs"></div></article><article class="panel-card"><h2>${esc(w.history)}</h2><div id="auto-history" class="automation-history"></div></article><article class="panel-card"><h2>${esc(w.diagnostics)}</h2><div id="auto-diagnostics"></div></article></div></div>`;
+      <div class="automation-stack"><article class="panel-card"><h2>${esc(w.rules)}</h2><div id="auto-rules"></div></article><article class="panel-card"><div class="section-head"><h2>${esc(w.discovered)}</h2><button id="auto-rescan" class="soft-button">${esc(w.rescan)}</button></div><input id="auto-search" class="automation-search" type="search" placeholder="${esc(w.search)}" aria-label="${esc(w.search)}"><div id="auto-live"></div><button id="auto-show-all" type="button" class="soft-button" aria-controls="auto-live" aria-expanded="false" hidden></button></article><article class="panel-card"><h2>${esc(w.jobs)}</h2><div id="auto-jobs"></div></article><article class="panel-card"><h2>${esc(w.history)}</h2><div id="auto-history" class="automation-history"></div></article><article class="panel-card"><h2>${esc(w.diagnostics)}</h2><div id="auto-diagnostics"></div></article></div></div>`;
     el('form').addEventListener('submit', save);
     el('clear').addEventListener('click', () => { editing = ''; reselecting = ''; notice(''); el('form').reset(); actionChanged(); render(); });
     el('action').addEventListener('change', actionChanged);
     el('trigger').addEventListener('change', actionChanged);
-    el('agent').addEventListener('change', () => { el('session').value = ''; actionChanged(); render(); });
+    el('agent').addEventListener('change', () => { el('session').value = ''; showAllSessions = false; actionChanged(); render(); });
     el('rescan').addEventListener('click', async () => { showResult(await api.rescanAutomationSessions()); await load(); });
-    el('search').addEventListener('input', render);
+    el('search').addEventListener('input', () => { showAllSessions = false; render(); });
+    el('show-all').addEventListener('click', () => { showAllSessions = !showAllSessions; render(); });
+    el('session').addEventListener('blur', () => renderSessionOptions(sessionCandidates()));
     el('session').addEventListener('input', render);
     render(); actionChanged();
   }
@@ -165,20 +184,24 @@
   function render() {
     if (!el('rules')) return;
     const w = c(), empty = `<p class="automation-intro">${esc(w.empty)}</p>`;
-    const candidates = (state.choices || state.sessions).filter(s => (s.agent || 'codex') === el('agent').value).sort((a, b) => Number(['running', 'waiting_input'].includes(b.kind)) - Number(['running', 'waiting_input'].includes(a.kind)) || (b.at || 0) - (a.at || 0));
-    el('sessions').innerHTML = candidates.map(s => `<option value="${esc(s.sessionId)}">${esc(s.title || s.cwd || s.sessionId)} · ${esc(w.states[s.kind] || s.kind)}</option>`).join('');
+    const candidates = sessionCandidates();
+    renderSessionOptions(candidates);
     const current = sessionFields(el('agent').value, el('session').value);
     el('session-title').textContent = current.sessionTitle;
     const search = el('search').value.trim().toLowerCase();
-    el('live').innerHTML = candidates.filter(s => !search || `${s.title || ''} ${s.sessionId}`.toLowerCase().includes(search)).slice(0, 50).map(s => `<div class="automation-item ${s.sessionId === el('session').value ? 'automation-selected' : ''}"><strong>${esc(s.title || s.cwd || s.sessionId)}</strong><small>${esc(agentName(s.agent))} · ${esc(w.states[s.kind] || s.kind)} · ${esc(date(s.at))}</small><small>${esc(s.sessionId)}</small>${button('select', s.sessionId, w.select, s.agent || 'codex')}</div>`).join('') || empty;
+    const matches = candidates.filter(s => !search || `${s.title || ''} ${s.sessionId}`.toLowerCase().includes(search));
+    el('show-all').hidden = matches.length <= 5;
+    el('show-all').setAttribute('aria-expanded', String(showAllSessions));
+    el('show-all').textContent = showAllSessions ? w.collapse : `${w.showAll} (${matches.length})`;
+    setHTML('live', (showAllSessions ? matches : matches.slice(0, 5)).map(s => `<div class="automation-item ${s.sessionId === el('session').value ? 'automation-selected' : ''}"><strong>${esc(s.title || s.cwd || s.sessionId)}</strong><small>${esc(agentName(s.agent))} · ${esc(w.states[s.kind] || s.kind)} · ${esc(date(s.at))}</small><small>${esc(s.sessionId)}</small>${button('select', s.sessionId, w.select, s.agent || 'codex')}</div>`).join('') || empty);
     const d = state.diagnostics;
-    el('diagnostics').innerHTML = d ? `<div class="automation-item"><small>${esc(w.source)}: ${esc(d.sourceRoot)}</small><small>${esc(w.configPath)}: ${esc(d.configPath)}</small><small>${esc(w.loaded)}: ${esc(date(d.loadedAt))}</small></div>${(d.watchers || []).map(x => `<div class="automation-item"><strong>${esc(agentName(x.agent))} · ${x.disabled ? esc(w.disabled) : `${esc(w.tracked)} ${x.tracked || 0}`}</strong><small>${esc(x.path || '')}${x.exists === false ? ` · ${esc(w.missing)}` : ''}</small></div>`).join('')}` : empty;
-    el('rules').innerHTML = state.rules.map(r => `<div class="automation-item ${r.enabled ? '' : 'automation-muted'}"><strong>${esc(r.name)}</strong><p>${esc(w.triggers[r.trigger] || r.trigger)} → ${esc(w.actions[r.action] || r.action)}</p><small class="automation-task-title">${esc(w.taskTitle)}: ${esc(r.sessionTitle || (state.choices || state.sessions).find(s => (s.agent || 'codex') === r.agent && s.sessionId === r.sessionId)?.title || w.untitled)}</small>${r.trigger === 'scheduled' ? `<small>${esc(w.at)}: ${esc(date(r.scheduledAt))}</small>` : ''}${r.needsSchedule ? `<p class="automation-countdown">${esc(w.needsSchedule)}</p>` : ''}<small>${esc(agentName(r.agent))} · ${esc(r.sessionId)} · ${esc(w.runs)} ${state.counts[r.id] || 0}/${r.maxRuns}</small><div class="automation-actions">${button('edit', r.id, w.edit)}${button('reselect', r.id, w.reselect)}${button('toggle', r.id, r.enabled ? w.disable : w.enable)}${button('reset', r.id, w.reset)}${button('remove', r.id, w.remove)}</div></div>`).join('') || empty;
-    el('jobs').innerHTML = state.jobs.slice(0, 25).map(j => {
+    setHTML('diagnostics', d ? `<div class="automation-item"><small>${esc(w.source)}: ${esc(d.sourceRoot)}</small><small>${esc(w.configPath)}: ${esc(d.configPath)}</small><small>${esc(w.loaded)}: ${esc(date(d.loadedAt))}</small></div>${(d.watchers || []).map(x => `<div class="automation-item"><strong>${esc(agentName(x.agent))} · ${x.disabled ? esc(w.disabled) : `${esc(w.tracked)} ${x.tracked || 0}`}</strong><small>${esc(x.path || '')}${x.exists === false ? ` · ${esc(w.missing)}` : ''}</small></div>`).join('')}` : empty);
+    setHTML('rules', state.rules.map(r => `<div class="automation-item ${r.enabled ? '' : 'automation-muted'}"><strong>${esc(r.name)}</strong><p>${esc(w.triggers[r.trigger] || r.trigger)} → ${esc(w.actions[r.action] || r.action)}</p><small class="automation-task-title">${esc(w.taskTitle)}: ${esc(r.sessionTitle || (state.choices || state.sessions).find(s => (s.agent || 'codex') === r.agent && s.sessionId === r.sessionId)?.title || w.untitled)}</small>${r.trigger === 'scheduled' ? `<small>${esc(w.at)}: ${esc(date(r.scheduledAt))}</small>` : ''}${r.needsSchedule ? `<p class="automation-countdown">${esc(w.needsSchedule)}</p>` : ''}<small>${esc(agentName(r.agent))} · ${esc(r.sessionId)} · ${esc(w.runs)} ${state.counts[r.id] || 0}/${r.maxRuns}</small><div class="automation-actions">${button('edit', r.id, w.edit)}${button('reselect', r.id, w.reselect)}${button('toggle', r.id, r.enabled ? w.disable : w.enable)}${button('reset', r.id, w.reset)}${button('remove', r.id, w.remove)}</div></div>`).join('') || empty);
+    setHTML('jobs', state.jobs.slice(0, 25).map(j => {
       const countdown = j.status === 'scheduled' ? `<p class="automation-countdown">${Math.max(0, Math.ceil((j.dueAt - Date.now()) / 1000))} ${esc(w.remaining)}</p>` : '';
       return `<div class="automation-item"><strong>${esc(j.ruleName)} · ${esc(w.states[j.status] || j.status)}</strong><small>${esc(w.actions[j.action])} · ${esc(date(j.createdAt))}</small>${countdown}${j.message ? `<p>${esc(j.message)}</p>` : ''}${['scheduled', 'waiting_idle'].includes(j.status) ? button('cancel', j.id, w.cancel) : ''}</div>`;
-    }).join('') || empty;
-    el('history').innerHTML = state.history.slice(0, 50).map(h => `<div class="automation-item"><small>${esc(date(h.at))}</small><p>${esc(w.events[h.kind] || w.states[h.kind] || h.kind)}${h.message ? ` · ${esc(h.message)}` : ''}</p></div>`).join('') || empty;
+    }).join('') || empty);
+    setHTML('history', state.history.slice(0, 50).map(h => `<div class="automation-item"><small>${esc(date(h.at))}</small><p>${esc(w.events[h.kind] || w.states[h.kind] || h.kind)}${h.message ? ` · ${esc(h.message)}` : ''}</p></div>`).join('') || empty);
     if (state.error) el('error').textContent = state.error;
   }
   root.addEventListener('click', async event => {

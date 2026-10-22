@@ -51,6 +51,11 @@ if (!process.versions.electron) {
   fs.writeFileSync(path.join(testDir, '.codex', 'session_index.jsonl'), [
     { id: sid, thread_name: 'UI 测试原会话' }, { id: sid2, thread_name: 'UI 测试替换会话' },
   ].map(x => JSON.stringify(x)).join('\n') + '\n');
+  for (let i = 0; i < 6; i++) {
+    const id = `019f5103-921c-7ac1-9a8d-c4f8ff8a67d${i}`;
+    fs.writeFileSync(path.join(sessions, `rollout-fold-${id}.jsonl`), JSON.stringify({ type: 'session_meta', payload: { id, cwd: root } }) + '\n'
+      + event({ type: 'task_complete', turn_id: `fold-history-${i}` }));
+  }
   const frozenTime = new Date(Date.now() - 3 * 3600000);
   fs.utimesSync(rollout, frozenTime, frozenTime);
   const claudeId = '019f5103-921c-7ac1-9a8d-c4f8ff8a67cc';
@@ -84,6 +89,23 @@ if (!process.versions.electron) {
       const discovered = await window.pet.getAutomation();
       if (!['codex','claude','dsh'].every(agent=>discovered.value.sessions.some(s=>s.agent===agent))) throw Error('Some agent sessions are missing');
       if (!discovered.value.diagnostics.sourceRoot || !document.getElementById('auto-diagnostics').textContent.includes('sessions')) throw Error('Scan diagnostics missing');
+      const ruleCard = document.getElementById('auto-rules').closest('article');
+      const sessionCard = document.getElementById('auto-live').closest('article');
+      if (!(ruleCard.compareDocumentPosition(sessionCard) & Node.DOCUMENT_POSITION_FOLLOWING)) throw Error('Saved rules must precede discovered sessions');
+      const displayed = () => document.querySelectorAll('#auto-live [data-auto="select"]').length;
+      const all = discovered.value.choices.filter(s => s.agent === 'codex').length;
+      if (all <= 5 || displayed() !== 5 || !visible('show-all')) throw Error('Discovered sessions must initially show five rows');
+      document.getElementById('auto-show-all').click();
+      if (displayed() !== all || document.getElementById('auto-show-all').getAttribute('aria-expanded') !== 'true') throw Error('Expand must show every discovered session');
+      document.getElementById('auto-show-all').click();
+      if (displayed() !== 5) throw Error('Collapse must return to five sessions');
+      const sessionInput = document.getElementById('auto-session'), firstOption = document.querySelector('#auto-sessions option');
+      sessionInput.focus(); sessionInput.value = '019'; sessionInput.dispatchEvent(new Event('input'));
+      await pause(1200);
+      if (document.querySelector('#auto-sessions option') !== firstOption) throw Error('Session dropdown options were replaced while choosing; native popup closes');
+      sessionInput.value = ${JSON.stringify(sid)}; sessionInput.dispatchEvent(new Event('input')); await pause(1100);
+      if (sessionInput.value !== ${JSON.stringify(sid)} || document.activeElement !== sessionInput) throw Error('Selected session and focus must survive refresh');
+      sessionInput.value = ''; sessionInput.blur();
       for (const agent of ['codex','claude','dsh']) {
         set('agent', agent);
         if (document.querySelector('#auto-trigger [value="quota_exhausted"], #auto-trigger [value="quota_restored"], #auto-action [value="wait_quota"]')) throw Error('Removed quota choices are still offered');
@@ -108,6 +130,7 @@ if (!process.versions.electron) {
       if (!document.getElementById('auto-notice').textContent.includes('保存成功')) throw Error('Save success feedback missing');
       const choose = async id => {
         document.querySelector('[data-auto="reselect"][data-id="'+r.id+'"]').click();
+        if (!document.querySelector('#auto-live [data-auto="select"][data-id="'+id+'"]')) document.getElementById('auto-show-all').click();
         const button = document.querySelector('#auto-live [data-auto="select"][data-id="'+id+'"]');
         if (!button) throw Error('One-click discovered conversation selection missing');
         button.click(); await pause(200);
@@ -181,6 +204,6 @@ if (!process.versions.electron) {
     console.log('LLMPET automation launch passed: Codex/Claude/DSH discovery, rule titles, one-click reselection, success feedback, local schedules, frozen-mtime recovery, hook/log triggers, cancellation, conditional fields, diagnostics, zh/en/ja');
     console.log(`Screenshot: ${path.join(testDir, 'automation.png')}`);
     app.quit();
-  })().catch(err => { console.error(err.stack); app.exit(1); });
+  })().catch(err => { fs.writeFileSync(path.join(testDir, 'failure.txt'), err.stack); console.error(err.stack); setTimeout(() => app.exit(1), 100); });
   setTimeout(() => { console.error('Launch check timed out'); app.exit(2); }, 25000).unref();
 }
